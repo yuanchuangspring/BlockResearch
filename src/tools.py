@@ -230,6 +230,20 @@ async def fetch_page(url: str, search: str = "") -> dict:
         text = soup.get_text("\n", strip=True)
         result = {"url": url, "text": text[:20000], "links": links}
         if mirrored: result["fetched_via"] = "text_mirror"
+        # If direct fetch returned thin/no text, try the mirror as a second chance
+        if not mirrored and len(text) < 200:
+            try:
+                async with httpx.AsyncClient(timeout=40, follow_redirects=True) as client:
+                    mirror_resp = await client.get(f"https://r.jina.ai/{url}",
+                                                   headers={"User-Agent": "BlockResearch/3.0"})
+                    mirror_resp.raise_for_status()
+                    mirror_text = mirror_resp.text
+                    if len(mirror_text) >= 200:
+                        text = mirror_text
+                        result = {"url": url, "text": text[:20000], "links": links,
+                                  "fetched_via": "text_mirror_thin_fallback"}
+            except Exception:
+                pass
         terms = [term.lower() for term in re.findall(r"[\w-]+", search) if len(term) > 2]
         hits = []
         for term in terms:
