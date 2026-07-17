@@ -1,0 +1,13 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+.idea/
+*.egg-info/
+dist/
+eval_traces/
+.DS_Store
+*.swp
+*.swo
+.claude/
+memory/
