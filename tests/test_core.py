@@ -272,6 +272,17 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
         prompt = notebook.prompt()
         self.assertIn("Wrong Candidate", prompt)
 
+    def test_support_level_matches_quote_across_newlines_in_text_field(self):
+        notebook = ResearchNotebook()
+        # Quote has words separated by a space, but in the source text
+        # they appear on different lines (newline-separated).
+        # This tests the fix for JSON-encoding breaking newline matching.
+        output = {"_type": "FETCH", "url": "https://example.com",
+                  "text": "Originalsprache\nDeutsch\n(\nWienerisch\n)\nErscheinungsjahre\n1975–1979\nLänge\n45\nMinuten"}
+        level = notebook._support_level(
+            {"claim": "series is in German", "quote": "Originalsprache Deutsch"}, output)
+        self.assertEqual(level, "verified")
+
     def test_evidence_graph_includes_stage_summaries_in_to_dict(self):
         notebook = ResearchNotebook()
         notebook.record_stage_summary(1, new_verified=1, new_leads=3,

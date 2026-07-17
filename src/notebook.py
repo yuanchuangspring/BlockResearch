@@ -54,7 +54,15 @@ class ResearchNotebook:
             for document in _items(documents):
                 if not isinstance(document, dict):
                     continue
-                body = _text(json.dumps(document, ensure_ascii=False, default=str)).lower()
+                # Search in raw text fields first (avoids JSON newline-escaping bugs),
+                # then fall back to the full JSON body.
+                text_fields = " ".join(
+                    _text(v) for k, v in document.items()
+                    if k in ("text", "title", "snippet", "first_page", "last_page", "stdout")
+                    and isinstance(v, str)
+                ).lower()
+                json_body = _text(json.dumps(document, ensure_ascii=False, default=str)).lower()
+                body = f"{text_fields} {json_body}"
                 overlap = len(quote_tokens & set(re.findall(r"[a-z0-9]+", body))) / max(len(quote_tokens), 1)
                 if quote in body or (len(quote_tokens) >= 5 and overlap >= .8):
                     return level
