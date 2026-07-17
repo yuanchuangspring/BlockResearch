@@ -83,7 +83,7 @@ def compact_source(value, text_limit=6000):
         value["results"] = value["results"][:16]
     if isinstance(value.get("pages"), list):
         value["pages"] = [
-            compact_source(page, min(text_limit, 1800)) for page in value["pages"][:3]
+            compact_source(page, min(text_limit, 4000)) for page in value["pages"][:3]
         ]
     if "search_hits" in value:
         value["search_hits"] = [
