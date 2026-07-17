@@ -15,6 +15,24 @@ def _candidate(value):
     return "" if candidate.lower() in {"none", "unknown", "no match", "no match found", "not found", "n/a"} else candidate
 
 
+def _stage_stats(outputs, nodes):
+    """Count tool successes and failures from stage outputs."""
+    successful, failed = 0, 0
+    for node in nodes:
+        output = node.get("output") or {}
+        ntype = node.get("type", "")
+        if ntype in ("FETCH", "READ_PDF", "BROWSE"):
+            if output.get("error"):
+                failed += 1
+            elif ntype in ("FETCH", "READ_PDF") and output.get("text") and len(str(output.get("text", ""))) >= 100:
+                successful += 1
+            elif ntype == "BROWSE":
+                pages = output.get("pages", []) if isinstance(output.get("pages"), list) else []
+                if any(isinstance(p, dict) and len(str(p.get("text", ""))) >= 100 for p in pages):
+                    successful += 1
+    return successful, failed
+
+
 async def research(question: str, max_stages: int = 8) -> dict:
     notebook, trace, all_outputs, fallback = ResearchNotebook(), [], {}, ""
     for stage in range(1, max_stages + 1):
@@ -27,12 +45,23 @@ async def research(question: str, max_stages: int = 8) -> dict:
             for block in blocks:
                 print(f"  [{block['type']}] {block['id']}" + (f" ← {block['depends_on']}" if block["depends_on"] else ""))
 
+            pre_claims, pre_leads, pre_hypotheses = len(notebook.claims), len(notebook.leads), len(notebook.hypotheses)
             outputs, nodes = await execute_stage(question, plan, notebook, stage, build_node)
             all_outputs.update(outputs)
+            n_successful, n_failed = _stage_stats(outputs, nodes)
+            notebook.record_stage_summary(
+                stage,
+                new_verified=len(notebook.claims) - pre_claims,
+                new_leads=len(notebook.leads) - pre_leads,
+                successful_pages=n_successful,
+                failed_fetches=n_failed,
+                candidate_changes=len(notebook.hypotheses) - pre_hypotheses,
+            )
             stage_trace = {"stage": stage, "build_node": build_node, "objective": plan.get("objective", ""),
                            "rationale": plan.get("rationale", ""), "nodes": nodes}
 
             candidates = [value for value in outputs.values() if isinstance(value, dict) and _candidate(value.get("answer_candidate"))]
+            rejected_this_stage = []
             for solver in reversed(candidates):
                 candidate, ids = _candidate(solver["answer_candidate"]), set(solver.get("support_claim_ids") or [])
                 fallback = candidate or fallback
@@ -50,9 +79,12 @@ async def research(question: str, max_stages: int = 8) -> dict:
                     return _result(f"ANSWER: {candidate}", stage, trace, all_outputs, notebook)
                 reason = str(verdict.get("reason", "verification rejected"))
                 notebook.reject_answer(candidate, reason)
+                rejected_this_stage.append(candidate)
                 if fallback == candidate:
                     fallback = ""
                 notebook.questions = (notebook.questions + [reason])[-12:]
+            if rejected_this_stage and notebook.stage_summaries:
+                notebook.stage_summaries[-1]["verifier_rejected"] = rejected_this_stage
             trace.append(stage_trace)
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"

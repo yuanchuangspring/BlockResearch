@@ -9,6 +9,27 @@ BUILDER_PROMPT = """You are the Builder of a deep-research system. At every stag
 
 Your job is orchestration, not answering the domain question. Any professional inference must be delegated to a SOLVE node.
 
+The RESEARCH STATE includes a `last_stage` summary (null on stage 1). Use it to choose the graph's strategic mode:
+
+DISCOVERY mode — no concrete named candidates exist yet, or last_stage shows 0 verified claims with many leads:
+  Goal: find indexable named entities matching the rarest clues.
+  Use independent BROWSE nodes with rare quoted phrases, event names, titles, or relationships.
+  Use a query-strategist SOLVE → dynamic BROWSE to translate clues into source vocabulary.
+  Prefer parallel specialist SOLVE nodes exploring different clue combinations, then a Join SOLVE.
+
+EVIDENCE mode — named candidates exist but verified_claims are sparse or empty, or last_stage shows 0 verified claims with few successful pages:
+  Goal: get full-text pages that can produce verified claims.
+  FETCH/READ_PDF URLs already in leads. BROWSE for credible primary sources (official announcements, archives, filings, publications).
+  Do NOT accumulate more search snippets of the same kind. Change the discovery anchor if the current one yields only SEO/query-echo pages.
+
+DISCRIMINATION mode — verified_claims exist for at least one candidate:
+  Goal: verify the most discriminating unresolved conditions; prune contradicted candidates.
+  FETCH/READ_PDF specific sources. BROWSE for the exact missing condition.
+  If a candidate has a contradicted required condition, prune it and allocate search to alternatives.
+  On the final stage, execute every proposed query inside the same DAG (SOLVE → BROWSE → SOLVE chain).
+
+If last_stage shows 0 verified_claims for two consecutive stages, change strategy: do not accumulate more BROWSE snippets of the same kind. Instead FETCH/READ_PDF a credible URL already in state, or change the discovery anchor entirely, or re-open alternative candidate branches.
+
 Graph contract:
 - Return 2-8 blocks. Use unique short ids and valid depends_on edges.
 - Available nodes:
@@ -73,9 +94,14 @@ Use one rare quoted phrase or at most two relations per discovery query. Never c
 Return {"reasoning":"...","queries":[],"hypotheses":[{"entity":"...","aliases":[],"coverage":[{"condition_id":"k1","status":"lead","evidence_ids":["c1"]}],"rejected_reason":""}],"gaps":[],"answer_candidate":"","support_claim_ids":[]}."""
 
 VERIFIER_PROMPT = """You are the final Answer Verifier. You may accept or reject the Solver's exact candidate; you may not replace it.
-Accept only when cited verified claims jointly support the requested identity and exact answer attribute, without unresolved contradiction.
-Check the complete identity chain against every atomic condition and candidate coverage. Evidence for only the final attribute (such as a degree) is insufficient if it does not link that person to the discovered source entity, event, work, or relationship.
-Return {"accepted":false,"reason":"..."}."""
+
+Accept ONLY when ALL of these hold simultaneously:
+1. Every atomic condition is supported by at least one cited verified claim or the candidate coverage graph shows it as verified, with no condition left as unknown/lead/contradicted.
+2. The complete identity chain is closed: the cited claims must connect the question's subject entity → the candidate person → the exact requested attribute. A claim that the candidate has a degree is worthless unless it is also established that the candidate IS the person described by the question conditions.
+3. There is no unresolved contradiction on any required condition.
+
+Explicitly check each condition one by one. If any condition lacks verified support, or the person-identity link is unproven, you MUST reject.
+Return {"accepted":false,"reason":"state which conditions are unverified and why the identity chain is broken."}."""
 
 
 def _model(role, default=None):
@@ -136,5 +162,19 @@ async def solve_node(question, task, role, notebook, observations):
 
 
 async def verify_answer(question, candidate, claims, sources, conditions=None, hypotheses=None):
-    user = f"QUESTION:\n{question}\n\nATOMIC CONDITIONS:\n{json_text(conditions or [], 8000)}\n\nCANDIDATE COVERAGE GRAPH:\n{json_text(hypotheses or [], 12000)}\n\nCANDIDATE:\n{candidate}\n\nCITED VERIFIED CLAIMS:\n{json_text(claims, 18000)}\n\nSOURCE EXCERPTS:\n{json_text(sources, 24000)}"
+    condition_checklist = "\n".join(
+        f"{i+1}. [{c.get('id', '?')}] {c.get('description', '')}"
+        for i, c in enumerate((conditions or [])[:16])
+    )
+    user = (
+        f"QUESTION:\n{question}\n\n"
+        f"ATOMIC CONDITIONS (every one must be verified):\n{condition_checklist}\n\n"
+        f"CANDIDATE COVERAGE GRAPH:\n{json_text(hypotheses or [], 12000)}\n\n"
+        f"CANDIDATE:\n{candidate}\n\n"
+        f"CITED VERIFIED CLAIMS:\n{json_text(claims, 18000)}\n\n"
+        f"SOURCE EXCERPTS:\n{json_text(sources, 24000)}\n\n"
+        f"Check each condition above. For each one, state whether the cited claims prove it. "
+        f"Only accept if EVERY condition is proven AND the identity chain is closed "
+        f"(the candidate IS the entity the question asks about, not just someone with a matching attribute)."
+    )
     return await ask_json(VERIFIER_PROMPT, user, _model("VERIFIER"), 2048)

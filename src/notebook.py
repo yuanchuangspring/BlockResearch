@@ -18,6 +18,7 @@ class ResearchNotebook:
         self.hypotheses, self.questions, self.reasoning, self.rejected_answers = [], [], [], []
         self.conditions, self.entities, self.sources = [], {}, {}
         self.graph, self.answer = [], ""
+        self.stage_summaries = []
 
     def add_node(self, kind, payload, depends_on=()):
         node_id = f"n{len(self.graph) + 1}"
@@ -193,11 +194,22 @@ class ResearchNotebook:
             self.rejected_answers += [{"candidate": shown, "reason": _text(reason)} for _, shown in sorted(names.items())]
             self.rejected_answers = self.rejected_answers[-12:]
 
+    def record_stage_summary(self, stage: int, new_verified: int, new_leads: int,
+                             successful_pages: int, failed_fetches: int, candidate_changes: int,
+                             verifier_rejected: list = None):
+        self.stage_summaries.append({
+            "stage": stage, "new_verified_claims": new_verified, "new_leads": new_leads,
+            "successful_pages": successful_pages, "failed_fetches": failed_fetches,
+            "candidate_changes": candidate_changes, "verifier_rejected": verifier_rejected or [],
+        })
+        self.stage_summaries = self.stage_summaries[-4:]
+
     def prompt(self):
         referenced = {evidence for item in self.hypotheses for cover in _items(item.get("coverage"))
                       for evidence in _items(cover.get("evidence_ids"))}
         selected = [item for item in self.leads if item["id"] in referenced]
         selected += [item for item in self.leads[-30:] if item not in selected]
+        last_stage = self.stage_summaries[-1] if self.stage_summaries else None
         return json.dumps({
             "source_policy": "search_leads are untrusted navigation hints, never facts; ignore query echoes, unrelated domains, and snippets without a concrete named entity",
             "candidate_policy": "hypotheses contain concrete named entities only; any candidate contradicting a required condition is pruned and must not drive confirmation search",
@@ -205,6 +217,7 @@ class ResearchNotebook:
             "candidate_condition_graph": self.hypotheses, "open_questions": self.questions,
             "rejected_answers": self.rejected_answers,
             "recent_reasoning": self.reasoning,
+            "last_stage": last_stage,
             "graph_tail": [{key: node.get(key) for key in ("id", "kind", "depends_on", "goal", "claim_ids") if key in node}
                            for node in self.graph[-20:]],
         }, ensure_ascii=False, indent=2)
