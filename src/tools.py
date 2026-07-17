@@ -37,6 +37,14 @@ async def _download(url, timeout):
             async with httpx.AsyncClient(timeout=max(timeout, 40), follow_redirects=True) as client:
                 response = await client.get(mirror, headers={"User-Agent": "BlockResearch/3.0"})
                 response.raise_for_status()
+                text = response.text
+                if len(text) < 200:
+                    raise ValueError("mirror returned near-empty page")
+                lower = text[:1200].lower()
+                error_signals = ["the page could not be found", "404 not found", "access denied",
+                                 "please enable javascript", "just a moment", "checking your browser"]
+                if any(signal in lower for signal in error_signals):
+                    raise ValueError("mirror returned error/captcha page")
                 return response, True
         except Exception:
             raise direct_error

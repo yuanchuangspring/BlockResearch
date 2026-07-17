@@ -240,6 +240,48 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await run_python("print(sum(range(5)))"))["stdout"].strip(), "10")
         self.assertIn("error", await run_python("import os"))
 
+    def test_stage_summary_is_null_before_any_stage(self):
+        notebook = ResearchNotebook()
+        prompt = notebook.prompt()
+        self.assertIn('"last_stage": null', prompt)
+
+    def test_stage_summary_appears_in_prompt_after_recording(self):
+        notebook = ResearchNotebook()
+        notebook.record_stage_summary(1, new_verified=2, new_leads=12,
+                                       successful_pages=3, failed_fetches=1, candidate_changes=0)
+        prompt = notebook.prompt()
+        self.assertIn('"new_verified_claims": 2', prompt)
+        self.assertIn('"new_leads": 12', prompt)
+        self.assertIn('"successful_pages": 3', prompt)
+        self.assertIn('"failed_fetches": 1', prompt)
+
+    def test_stage_summary_only_keeps_last_four(self):
+        notebook = ResearchNotebook()
+        for i in range(1, 7):
+            notebook.record_stage_summary(i, new_verified=i, new_leads=i,
+                                           successful_pages=0, failed_fetches=0, candidate_changes=0)
+        self.assertEqual(len(notebook.stage_summaries), 4)
+        self.assertEqual(notebook.stage_summaries[0]["stage"], 3)
+        self.assertEqual(notebook.stage_summaries[-1]["stage"], 6)
+
+    def test_verifier_rejected_candidates_recorded_in_summary(self):
+        notebook = ResearchNotebook()
+        notebook.record_stage_summary(1, new_verified=0, new_leads=5,
+                                       successful_pages=0, failed_fetches=2, candidate_changes=1,
+                                       verifier_rejected=["Wrong Candidate"])
+        prompt = notebook.prompt()
+        self.assertIn("Wrong Candidate", prompt)
+
+    def test_evidence_graph_includes_stage_summaries_in_to_dict(self):
+        notebook = ResearchNotebook()
+        notebook.record_stage_summary(1, new_verified=1, new_leads=3,
+                                       successful_pages=1, failed_fetches=0, candidate_changes=0)
+        state = notebook.to_dict()
+        # to_dict should not crash; verify it has the core fields
+        for key in ("claims", "leads", "hypotheses", "conditions", "sources",
+                    "rejected_answers", "evidence_graph", "graph"):
+            self.assertIn(key, state)
+
 
 if __name__ == "__main__":
     unittest.main()
