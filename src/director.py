@@ -28,7 +28,7 @@ DISCRIMINATION mode — verified_claims exist for at least one candidate:
   If a candidate has a contradicted required condition, prune it and allocate search to alternatives.
   On the final stage, execute every proposed query inside the same DAG (SOLVE → BROWSE → SOLVE chain).
 
-If last_stage shows 0 verified_claims for two consecutive stages, change strategy: do not accumulate more BROWSE snippets of the same kind. Instead FETCH/READ_PDF a credible URL already in state, or change the discovery anchor entirely, or re-open alternative candidate branches.
+If last_stage.consecutive_zero_stages >= 2, the current approach is failing — change strategy immediately: do not accumulate more BROWSE snippets of the same kind. Instead FETCH/READ_PDF a credible URL already in state, or change the discovery anchor entirely, or re-open alternative candidate branches. Do NOT run another BROWSE-heavy stage with similar queries.
 
 Graph contract:
 - Return 2-8 blocks. Use unique short ids and valid depends_on edges.

@@ -205,10 +205,14 @@ class ResearchNotebook:
     def record_stage_summary(self, stage: int, new_verified: int, new_leads: int,
                              successful_pages: int, failed_fetches: int, candidate_changes: int,
                              verifier_rejected: list = None):
+        consecutive = 1
+        if self.stage_summaries and self.stage_summaries[-1]["new_verified_claims"] == 0:
+            consecutive = self.stage_summaries[-1].get("consecutive_zero_stages", 1) + (1 if new_verified == 0 else 0)
         self.stage_summaries.append({
             "stage": stage, "new_verified_claims": new_verified, "new_leads": new_leads,
             "successful_pages": successful_pages, "failed_fetches": failed_fetches,
             "candidate_changes": candidate_changes, "verifier_rejected": verifier_rejected or [],
+            "consecutive_zero_stages": consecutive if new_verified == 0 else 0,
         })
         self.stage_summaries = self.stage_summaries[-4:]
 
