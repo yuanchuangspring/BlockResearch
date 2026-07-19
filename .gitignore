@@ -1,4 +1,5 @@
 .env
+data/browse_comp_test_set.csv
 .venv/
 __pycache__/
 *.pyc

@@ -5,18 +5,36 @@ from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 
 _client = None
+_new_client = None
 
-def _get():
-    global _client
-    if _client is None:
-        _client = AsyncOpenAI(
-            api_key=os.environ["OPENAI_API_KEY"],
-            base_url=os.environ.get("OPENAI_ENDPOINT", "https://api.openai.com/v1"),
-            timeout=float(os.environ.get("LLM_TIMEOUT", 90)))
-    return _client
+def _alternate(model: str) -> bool:
+    """Route non-DeepSeek model families through the optional second endpoint."""
+    return bool(os.environ.get("NEW_API_KEY") and os.environ.get("NEW_BASE_URL")
+                and model.startswith(("gpt-", "claude-", "gemini-")))
 
-def _reset():
-    global _client; _client = None
+def _get(model: str):
+    global _client, _new_client
+    alternate = _alternate(model)
+    name = "_new_client" if alternate else "_client"
+    client = globals()[name]
+    if client is None:
+        client = AsyncOpenAI(
+            api_key=os.environ["NEW_API_KEY" if alternate else "OPENAI_API_KEY"],
+            base_url=os.environ.get(
+                "NEW_BASE_URL" if alternate else "OPENAI_ENDPOINT",
+                "https://api.openai.com/v1"),
+            timeout=float(os.environ.get("LLM_TIMEOUT", 90)),
+            # Retries are owned by ask(); SDK defaults would silently turn one
+            # 90-second request into three attempts.
+            max_retries=0)
+        globals()[name] = client
+    return client
+
+def _reset(model: str):
+    global _client, _new_client
+    if _alternate(model): _new_client = None
+    else: _client = None
+
 
 def _parse_think_answer(text: str) -> tuple[str, str]:
     """从 <think>...</think><answer>...</answer> 中提取思维链和答案。"""
@@ -48,29 +66,36 @@ def _json_object(text: str):
 async def ask(system: str, user: str, model=None, max_tokens=8192, retries=2) -> tuple[str, str]:
     """返回 (thinking, answer)。"""
     model = model or os.environ.get("OPENAI_MODEL", "deepseek-v4-flash")
+    retries = 1 if _alternate(model) else retries
     last_err, budget = None, max_tokens
     for attempt in range(retries):
         try:
-            resp = await _get().chat.completions.create(
-                model=model, max_tokens=budget,
-                messages=[{"role": "system", "content": system},
-                         {"role": "user", "content": user}])
+            params = {
+                "model": model, "max_tokens": budget,
+                "messages": [{"role": "system", "content": system},
+                             {"role": "user", "content": user}],
+            }
+            if _alternate(model):
+                params["reasoning_effort"] = os.environ.get("REASONING_EFFORT", "low")
+            request = _get(model).chat.completions.create(**params)
+            resp = await (asyncio.wait_for(request, float(os.environ.get("LLM_HARD_TIMEOUT", 120)))
+                          if _alternate(model) else request)
             choice = resp.choices[0]
             msg = choice.message
             content = msg.content or ""
             reasoning = getattr(msg, "reasoning_content", None) or ""
+            finish = choice.finish_reason or "unknown"
             if content:
                 embedded, answer = _parse_think_answer(content)
                 if answer:
                     thinking = "\n".join(x for x in (reasoning, embedded) if x)
                     return thinking, answer
-            finish = choice.finish_reason or "unknown"
             last_err = RuntimeError(f"model produced no final answer (finish_reason={finish})")
             if finish == "length":
                 budget = min(max(budget * 2, 1024), 32768)
             raise last_err
         except (APIConnectionError, APITimeoutError) as e:
-            last_err = e; _reset()
+            last_err = e; _reset(model)
             if attempt < retries - 1: await asyncio.sleep(1 + attempt)
         except Exception as e:
             last_err = e

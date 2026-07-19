@@ -9,12 +9,51 @@ import re
 import sys
 import tempfile
 import zipfile
-from urllib.parse import parse_qs, unquote, urljoin, urlparse
+from urllib.parse import unquote, urljoin, urlparse, urlunparse
 
 import httpx
+from dotenv import load_dotenv
+
+load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 
 
-_serper_available = True
+def _canonical_url(url):
+    parsed = urlparse(str(url))
+    host = parsed.netloc.lower().removeprefix("www.")
+    path = re.sub(r"/+", "/", parsed.path).rstrip("/") or "/"
+    return urlunparse((parsed.scheme.lower(), host, path, "", "", ""))
+
+
+def _query_echo(item, query):
+    terms = {x.lower() for x in re.findall(r"[\w-]+", query) if len(x) > 3}
+    parsed = urlparse(item.get("url", ""))
+    slug = set(re.findall(r"[\w-]+", unquote(f"{parsed.path} {parsed.query}").lower().replace("-", " ")))
+    return len(terms) >= 4 and len(terms & slug) / len(terms) >= .55
+
+
+def _merge_results(batches, query, limit):
+    """Fuse independent indexes while bounding duplicates and one-domain floods."""
+    merged, seen_urls, seen_titles, domains = [], set(), set(), {}
+    candidates = []
+    for backend, items in batches:
+        for rank, raw in enumerate(items, 1):
+            item = dict(raw)
+            item["backend"] = backend
+            item["backend_rank"] = rank
+            item["query_echo"] = _query_echo(item, query)
+            candidates.append(item)
+    for item in sorted(candidates, key=lambda value: (value["query_echo"], value["backend_rank"])):
+        url = _canonical_url(item.get("url", ""))
+        title = re.sub(r"\W+", " ", item.get("title", "").lower()).strip()
+        domain = urlparse(url).netloc
+        if not url or url in seen_urls or (title and title in seen_titles) or domains.get(domain, 0) >= 3:
+            continue
+        seen_urls.add(url)
+        if title: seen_titles.add(title)
+        domains[domain] = domains.get(domain, 0) + 1
+        merged.append(item)
+        if len(merged) >= limit: break
+    return merged
 
 
 def _web_headers(url):
@@ -60,107 +99,73 @@ def _docx_text(content):
         return ""
 
 
+def _passage(text, search, window=3000):
+    """Return the window with the densest query-term coverage, centered on evidence."""
+    terms = list(dict.fromkeys(term.lower() for term in re.findall(r"[\w-]+", search) if len(term) > 3))
+    if not terms or not text:
+        return "", 0
+    lower = text.lower()
+    positions = []
+    for term in terms:
+        positions.extend(match.start() for match in list(re.finditer(re.escape(term), lower))[:30])
+    best, best_score = "", 0
+    for position in positions:
+        start = max(0, position - window // 3)
+        chunk = text[start:start + window]
+        chunk_lower = chunk.lower()
+        coverage = sum(term in chunk_lower for term in terms)
+        frequency = sum(min(chunk_lower.count(term), 3) for term in terms)
+        score = coverage * 10 + frequency
+        if score > best_score:
+            best, best_score = chunk, score
+    return best, best_score
+
+
 def _expand_queries(queries):
-    original = [str(query).strip() for query in queries if str(query).strip()][:16]
-    expansions = []
-    ontology = r"\b(?:alias|nickname|sobriquet|epithet|by-?name|appellation)\b"
-    for query in original:
+    compiled = []
+    for raw in queries:
+        query = " ".join(str(raw).split())
+        if not query: continue
         quoted = re.findall(r'"([^"]+)"', query)
-        if quoted:
-            relaxed = re.sub(r'"([^"]+)"', r"\1", query)
-            if relaxed != query:
-                expansions.append(relaxed)
-            mixed = re.sub(r'"([^"]+)"', lambda match: match.group(1) if len(match.group(1).split()) == 1 else match.group(0), query)
-            expansions.extend([mixed, re.sub(ontology, "", mixed, flags=re.I)])
-        anchors = [item for item in quoted if len(item.split()) == 1]
-        phrases = [item for item in quoted if 2 <= len(item.split()) <= 5]
-        prefix = query.split('"', 1)[0].strip()
-        if not anchors and prefix and 1 <= len(prefix.split()) <= 3 and "site:" not in prefix:
-            anchors = [prefix]
-        if anchors and phrases:
-            expansions.extend(
-                f'"{anchors[0]}" "{token}"'
-                for token in phrases[0].split() if len(token) > 3
-            )
-    return list(dict.fromkeys(" ".join(item.split()) for item in original + expansions if item.strip()))[:20]
-
-
-async def _fallback_search(query: str, n: int) -> dict:
-    from bs4 import BeautifulSoup
-
-    headers = {"User-Agent": "Mozilla/5.0", "Accept-Language": "en-US,en;q=0.9"}
-    async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers=headers) as client:
-        try:
-            response = await client.get("https://search.yahoo.com/search", params={"p": query})
-            response.raise_for_status()
-            soup = BeautifulSoup(response.text, "html.parser")
-            results = []
-            for row in soup.select("div.algo"):
-                link = row.select_one("h3 a") or row.select_one(".compTitle a")
-                if not link:
-                    continue
-                url = link.get("href", "")
-                match = re.search(r"/RU=([^/]+)/RK=", url)
-                if match:
-                    url = unquote(match.group(1))
-                snippet = row.select_one(".compText") or row.select_one("p")
-                results.append({
-                    "title": link.get_text(" ", strip=True), "url": url,
-                    "snippet": snippet.get_text(" ", strip=True) if snippet else "",
-                })
-                if len(results) >= n:
-                    break
-            if results:
-                return {"results": results, "backend": "yahoo"}
-        except Exception:
-            pass
-
-        response = await client.get("https://lite.duckduckgo.com/lite/", params={"q": query})
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, "html.parser")
-        results = []
-        for link in soup.select("a.result-link"):
-            url = link.get("href", "")
-            if "uddg=" in url:
-                url = unquote(parse_qs(urlparse(url).query).get("uddg", [url])[0])
-            row = link.find_parent("tr")
-            snippet = row.find_next_sibling("tr") if row else None
-            results.append({
-                "title": link.get_text(" ", strip=True), "url": url,
-                "snippet": snippet.get_text(" ", strip=True) if snippet else "",
-            })
-            if len(results) >= n:
-                break
-        if not results:
-            raise RuntimeError("search backends returned no results")
-        return {"results": results, "backend": "duckduckgo"}
+        if len(quoted) <= 2:
+            compiled.append(query)
+            continue
+        # Split keyword bags into two source-shaped retrieval attempts.
+        compiled.append(f'"{quoted[0]}" "{quoted[1]}"')
+        context = " ".join(re.findall(r"\b[A-Za-z0-9-]+\b", re.sub(r'"[^"]+"', "", query))[:3])
+        if re.search(r"[A-Za-z]{3}", quoted[2]) and context:
+            compiled.append(f'"{quoted[2]}" {context}')
+    return list(dict.fromkeys(compiled))[:16]
 
 
 async def search(query: str, n: int = 5) -> dict:
-    global _serper_available
     if not query.strip():
         return {"error": "empty query", "results": []}
+    if not os.environ.get("BRAVE_API_KEY"):
+        return {"error": "BRAVE_API_KEY is not configured", "results": []}
     try:
-        if _serper_available and os.environ.get("SERPER_API_KEY"):
-            async with httpx.AsyncClient(timeout=20) as client:
-                response = await client.post(
-                    "https://google.serper.dev/search",
-                    json={"q": query, "num": min(max(int(n), 1), 10)},
-                    headers={"X-API-KEY": os.environ.get("SERPER_API_KEY", "")},
-                )
-                if response.status_code == 400:
-                    _serper_available = False
-                response.raise_for_status()
-            return {"results": [
-                {"title": item.get("title", ""), "url": item.get("link", ""), "snippet": item.get("snippet", "")}
-                for item in response.json().get("organic", [])
-            ], "backend": "serper"}
-        return await _fallback_search(query, min(max(int(n), 1), 10))
-    except Exception as primary:
-        try:
-            return await _fallback_search(query, min(max(int(n), 1), 10))
-        except Exception as fallback:
-            return {"error": f"primary: {primary}; fallback: {fallback}", "results": []}
+        count = min(max(int(n), 1), 20)
+        async def request(client, value):
+            response = await client.get(
+                "https://api.search.brave.com/res/v1/web/search",
+                params={"q": value, "count": count, "extra_snippets": "true"},
+                headers={"X-Subscription-Token": os.environ["BRAVE_API_KEY"], "Accept": "application/json"})
+            response.raise_for_status()
+            rows = []
+            for item in (response.json().get("web") or {}).get("results", []):
+                excerpts = [item.get("description", ""), *(item.get("extra_snippets") or [])]
+                rows.append({"title": item.get("title", ""), "url": item.get("url", ""),
+                             "snippet": " ".join(x for x in excerpts if x)[:1000]})
+            return rows
+        async with httpx.AsyncClient(timeout=20) as client:
+            exact = await request(client, query)
+            relaxed_query = re.sub(r'"([^"]+)"', r"\1", query)
+            relaxed = await request(client, relaxed_query) if relaxed_query != query and len(exact) < max(3, count // 2) else []
+        batches = [("brave", exact)] + ([("brave_relaxed", relaxed)] if relaxed else [])
+        return {"results": _merge_results(batches, query, count),
+                "backend": "brave"}
+    except Exception as exc:
+        return {"error": f"brave: {exc}", "results": []}
 
 
 async def browse(queries, n=5, fetch_per_query=1, search_terms="") -> dict:
@@ -197,6 +202,41 @@ async def browse(queries, n=5, fetch_per_query=1, search_terms="") -> dict:
     value = {"queries": queries, "results": results[:30], "pages": pages}
     if errors:
         value["search_errors"] = errors[:5]
+    return value
+
+
+async def search_many(queries, n=5) -> dict:
+    """Search without guessing which result should be fetched."""
+    if not isinstance(queries, list):
+        queries = [queries]
+    queries = _expand_queries(queries)
+    if not queries:
+        return {"error": "empty queries", "queries": [], "results": []}
+    gate = asyncio.Semaphore(3)
+    async def limited(query):
+        async with gate:
+            return await search(query, n)
+    batches = await asyncio.gather(*(limited(query) for query in queries))
+    results, seen_urls, seen_titles, domains = [], set(), set(), {}
+    max_rank = min(max(int(n), 1), 20)
+    for echo in (False, True):
+        for rank in range(max_rank):
+            for query, batch in zip(queries, batches):
+                items = batch.get("results", [])
+                if rank >= len(items) or bool(items[rank].get("query_echo")) != echo: continue
+                item = items[rank]
+                url = _canonical_url(item.get("url", ""))
+                title = re.sub(r"\W+", " ", item.get("title", "").lower()).strip()
+                domain = urlparse(url).netloc
+                if not url or url in seen_urls or (title and title in seen_titles) or domains.get(domain, 0) >= 4:
+                    continue
+                seen_urls.add(url)
+                if title: seen_titles.add(title)
+                domains[domain] = domains.get(domain, 0) + 1
+                results.append({**item, "query": query, "rank": rank + 1})
+    errors = [batch.get("error") for batch in batches if batch.get("error")]
+    value = {"queries": queries, "results": results[:40]}
+    if errors: value["search_errors"] = errors[:5]
     return value
 
 
@@ -244,12 +284,20 @@ async def fetch_page(url: str, search: str = "") -> dict:
                                   "fetched_via": "text_mirror_thin_fallback"}
             except Exception:
                 pass
-        terms = [term.lower() for term in re.findall(r"[\w-]+", search) if len(term) > 2]
-        hits = []
+        terms = sorted(set(term.lower() for term in re.findall(r"[\w-]+", search) if len(term) > 2),
+                       key=len, reverse=True)
+        hits, centers = [], []
+        passage, score = _passage(text, search)
+        if score:
+            hits.append({"term": "dense match", "text": passage})
         for term in terms:
             for match in list(re.finditer(re.escape(term), text, re.I))[:4]:
                 start = max(0, match.start() - 500)
+                if any(abs(start - old) < 800 for old in centers): continue
+                centers.append(start)
                 hits.append({"term": term, "text": text[start:match.end() + 2500]})
+                if len(hits) >= 16: break
+            if len(hits) >= 16: break
         if hits:
             result["search_hits"] = hits[:16]
         return result
@@ -270,16 +318,15 @@ async def read_pdf(url: str, search: str = "") -> dict:
             return {"error": "not a PDF", "url": str(response.url), "text": response.text[:3000]}
 
         doc = fitz.open(stream=response.content, filetype="pdf")
-        terms = list(dict.fromkeys(term.lower() for term in re.findall(r"[\w-]+", search) if len(term) > 3))
         chunks, ranked, size = [], [], 0
         for page_no, page in enumerate(doc, 1):
             text = page.get_text()
             if size < 36000:
                 chunks.append(text)
                 size += len(text)
-            score = sum(min(text.lower().count(term), 5) for term in terms)
+            passage, score = _passage(text, search)
             if score:
-                ranked.append((score, page_no, text))
+                ranked.append((score, page_no, passage))
         result = {
             "url": str(response.url), "pages": len(doc), "text": "\n".join(chunks)[:36000],
             "first_page": doc[0].get_text()[:3000] if doc else "",
@@ -288,7 +335,7 @@ async def read_pdf(url: str, search: str = "") -> dict:
         doc.close()
         if ranked:
             result["search_hits"] = [
-                {"page": page, "text": text[:2200]} for _, page, text in sorted(ranked, reverse=True)[:16]
+                {"page": page, "text": text} for _, page, text in sorted(ranked, reverse=True)[:16]
             ]
         return result
     except Exception as exc:

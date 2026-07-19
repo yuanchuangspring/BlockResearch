@@ -1,6 +1,5 @@
 """Stage-by-stage graph construction and execution loop."""
-from .context import compact_source
-from .director import build_stage, verify_answer
+from .director import build_stage
 from .executor import execute_stage, normalize_graph
 from .notebook import ResearchNotebook
 
@@ -38,14 +37,20 @@ async def research(question: str, max_stages: int = 8) -> dict:
     for stage in range(1, max_stages + 1):
         try:
             plan = await build_stage(question, notebook, stage, max_stages)
+            fallback = _candidate(plan.get("best_guess")) or fallback
             notebook.set_conditions(plan.get("conditions"))
+            notebook.record_builder(stage, plan)
+            if plan.get("decision") == "answer" and fallback and not plan.get("blocks"):
+                notebook.answer = fallback
+                return _result(f"ANSWER: {fallback}", stage, trace, all_outputs, notebook)
             blocks = normalize_graph(plan, stage)
             build_node = notebook.add_node("BUILD", {"stage": stage, "objective": plan.get("objective", ""), "blocks": blocks})
             print(f"\n🧱 S{stage}: {plan.get('objective', '')[:120]}")
             for block in blocks:
                 print(f"  [{block['type']}] {block['id']}" + (f" ← {block['depends_on']}" if block["depends_on"] else ""))
 
-            pre_claims, pre_leads, pre_hypotheses = len(notebook.claims), len(notebook.leads), len(notebook.hypotheses)
+            pre_claims, pre_inferences = len(notebook.claims), len(notebook.inferences)
+            pre_leads, pre_hypotheses = len(notebook.leads), len(notebook.hypotheses)
             outputs, nodes = await execute_stage(question, plan, notebook, stage, build_node)
             all_outputs.update(outputs)
             n_successful, n_failed = _stage_stats(outputs, nodes)
@@ -57,34 +62,29 @@ async def research(question: str, max_stages: int = 8) -> dict:
                 failed_fetches=n_failed,
                 candidate_changes=len(notebook.hypotheses) - pre_hypotheses,
             )
+            notebook.stage_summaries[-1]["new_derived_inferences"] = len(notebook.inferences) - pre_inferences
+            notebook.record_actions(
+                stage, plan, outputs,
+                information_gain=(len(notebook.claims) - pre_claims) +
+                                 (len(notebook.inferences) - pre_inferences) +
+                                 max(0, len(notebook.hypotheses) - pre_hypotheses),
+            )
             stage_trace = {"stage": stage, "build_node": build_node, "objective": plan.get("objective", ""),
                            "rationale": plan.get("rationale", ""), "nodes": nodes}
 
-            candidates = [value for value in outputs.values() if isinstance(value, dict) and _candidate(value.get("answer_candidate"))]
-            rejected_this_stage = []
-            for solver in reversed(candidates):
-                candidate, ids = _candidate(solver["answer_candidate"]), set(solver.get("support_claim_ids") or [])
-                fallback = candidate or fallback
-                claims = [claim for claim in notebook.claims if claim["id"] in ids]
-                sources = {
-                    claim["source_id"]: compact_source(all_outputs.get(claim.get("source_block_id", claim["source_id"]), {}), 3000)
-                    for claim in claims
-                }
-                verdict = await verify_answer(question, candidate, claims, sources, notebook.conditions, notebook.hypotheses)
-                verify_node = notebook.add_node("VERIFY", {"stage": stage, "candidate": candidate, **verdict})
-                stage_trace["verification"] = {"node": verify_node, "candidate": candidate, **verdict}
-                if verdict.get("accepted"):
-                    notebook.answer = candidate
-                    trace.append(stage_trace)
-                    return _result(f"ANSWER: {candidate}", stage, trace, all_outputs, notebook)
-                reason = str(verdict.get("reason", "verification rejected"))
-                notebook.reject_answer(candidate, reason)
-                rejected_this_stage.append(candidate)
-                if fallback == candidate:
-                    fallback = ""
-                notebook.questions = (notebook.questions + [reason])[-12:]
-            if rejected_this_stage and notebook.stage_summaries:
-                notebook.stage_summaries[-1]["verifier_rejected"] = rejected_this_stage
+            guesses = [_candidate(value.get("best_guess") or value.get("answer_candidate"))
+                       for value in outputs.values() if isinstance(value, dict)]
+            fallback = next((guess for guess in reversed(guesses) if guess), fallback)
+            accepted = next((value for value in outputs.values() if isinstance(value, dict)
+                             and value.get("_type") == "VERIFY" and value.get("accepted")), None)
+            if accepted:
+                notebook.answer = accepted["candidate"]
+                trace.append(stage_trace)
+                return _result(f"ANSWER: {accepted['candidate']}", stage, trace, all_outputs, notebook)
+            if plan.get("decision") == "answer" and fallback:
+                notebook.answer = fallback
+                trace.append(stage_trace)
+                return _result(f"ANSWER: {fallback}", stage, trace, all_outputs, notebook)
             trace.append(stage_trace)
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"

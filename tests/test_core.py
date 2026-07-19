@@ -1,37 +1,76 @@
 import unittest
+import json
 import io, zipfile
 
 from src import main
 import src.executor as executor
 import src.research as research_module
-from src.executor import _dependency_queries, normalize_graph
+import src.director as director_module
+from src.executor import _dependency_queries, _dependency_urls, normalize_graph
 from src.director import _stage_one_language_ok
 from src.research import _candidate
 from src.notebook import ResearchNotebook
-from src.tools import _docx_text, _expand_queries, calculate, run_python
+from src.tools import _docx_text, _expand_queries, _merge_results, _passage, calculate, run_python
+from src.retrieval import _compact_cards
 
 
 class CoreTests(unittest.IsolatedAsyncioTestCase):
     def test_answer_extraction(self):
         self.assertEqual(main.extract_answer("ANSWER: 109 — EURO 2016"), "109 — EURO 2016")
 
-    def test_stage_graph_is_canonical_and_has_solver(self):
+    def test_stage_graph_does_not_force_a_solver(self):
         graph = normalize_graph({"blocks": [{"id": "q", "type": "BROWSE", "params": {"queries": ["x"]}}]}, 2)
         self.assertEqual(graph[0]["id"], "s2_q")
-        self.assertEqual(graph[-1]["type"], "SOLVE")
-        self.assertEqual(graph[-1]["depends_on"], ["s2_q"])
+        self.assertEqual([item["type"] for item in graph], ["BROWSE"])
 
-    def test_terminal_tool_is_closed_by_sink_solver(self):
+    def test_builder_controls_where_solver_is_used(self):
         graph = normalize_graph({"blocks": [
             {"id": "strategy", "type": "SOLVE", "params": {}},
             {"id": "search", "type": "BROWSE", "params": {}, "depends_on": ["strategy"]},
         ]}, 1)
-        self.assertEqual(graph[-1]["type"], "SOLVE")
-        self.assertEqual(graph[-1]["depends_on"], ["s1_search"])
+        self.assertEqual([item["type"] for item in graph], ["SOLVE", "BROWSE"])
+        self.assertEqual(graph[-1]["depends_on"], ["s1_strategy"])
 
     def test_english_stage_one_rejects_unjustified_foreign_query_cluster(self):
         plan = {"blocks": [{"type": "BROWSE", "params": {"queries": ["医学 奖学金", "医生 朋友", "doctor scholarship"]}}]}
         self.assertFalse(_stage_one_language_ok("Which doctor won a scholarship?", plan))
+
+    async def test_question_modeling_precedes_builder_and_conditions_persist(self):
+        outputs = [
+            {"conditions": [{"id": "k1", "description": "the employee filed suit"},
+                            {"id": "k2", "description": "the court certified the class"}]},
+            {"objective": "search", "conditions": [],
+             "blocks": [{"id": "solve", "type": "SOLVE", "params": {}, "depends_on": []}]},
+        ]
+        async def fake_ask(*_args, **_kwargs): return outputs.pop(0)
+        old = director_module.ask_json
+        director_module.ask_json = fake_ask
+        notebook = ResearchNotebook()
+        try:
+            plan = await director_module.build_stage("Who matches both clues?", notebook, 1, 8)
+        finally:
+            director_module.ask_json = old
+        self.assertEqual([item["id"] for item in notebook.conditions], ["k1", "k2"])
+        self.assertTrue(plan["blocks"])
+
+    async def test_builder_retries_model_json_failure(self):
+        calls = 0
+        async def fake_ask(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return {"conditions": [{"id": "k1", "description": "answer attribute"}]}
+            if calls == 2:
+                raise ValueError("bad json")
+            return {"objective": "recover", "blocks": [{"id": "solve", "type": "SOLVE", "params": {}}]}
+        old = director_module.ask_json
+        director_module.ask_json = fake_ask
+        try:
+            plan = await director_module.build_stage("Who?", ResearchNotebook(), 1, 8)
+        finally:
+            director_module.ask_json = old
+        self.assertEqual(calls, 3)
+        self.assertEqual(plan["objective"], "recover")
 
     def test_no_match_sentinel_is_not_an_answer(self):
         self.assertEqual(_candidate("No match found"), "")
@@ -40,8 +79,41 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
         observations = {"strategy": {"queries": ["source vocabulary", "rare relation pair"]}}
         self.assertEqual(_dependency_queries(observations), ["source vocabulary", "rare relation pair"])
 
-    def test_quoted_search_has_relaxed_variant(self):
-        self.assertIn("mascot named by Joanna", _expand_queries(['"mascot" "named by Joanna"']))
+    def test_dynamic_fetch_accepts_only_urls_present_in_search_ancestors(self):
+        observations = {
+            "search": {"results": [{"url": "https://credible.example/a"}, {"url": "https://credible.example/b"},
+                                   {"url": "https://echo.example/query-copy", "query_echo": True}]},
+            "selector": {"urls": ["https://credible.example/b", "https://invented.example/x",
+                                    "https://echo.example/query-copy"]},
+        }
+        self.assertEqual(_dependency_urls(observations), ["https://credible.example/b"])
+
+    def test_dynamic_fetch_can_select_ranked_domain_diverse_results_without_llm(self):
+        observations = {"search": {"results": [
+            {"url": "https://a.example/one"}, {"url": "https://a.example/two"},
+            {"url": "https://b.example/page"},
+            {"url": "https://echo.example/copy", "query_echo": True},
+        ]}}
+        self.assertEqual(_dependency_urls(observations, auto_select=True),
+                         ["https://a.example/one", "https://b.example/page"])
+
+    def test_query_batch_does_not_eagerly_double_every_quoted_query(self):
+        self.assertEqual(_expand_queries(['"mascot" "named by Joanna"']), ['"mascot" "named by Joanna"'])
+
+    def test_query_compiler_splits_three_phrase_keyword_bag(self):
+        self.assertEqual(_expand_queries(['"former employee" "class action" "class certified" settlement']),
+                         ['"former employee" "class action"', '"class certified" settlement'])
+
+    def test_query_echo_is_ranked_after_a_real_page(self):
+        echo = {"title": "Query copy", "url": "https://x.test/rare-relation-person-place-year-event"}
+        real = {"title": "Archive record", "url": "https://archive.test/item/42"}
+        rows = _merge_results([("brave", [echo, real])], "rare relation person place year event", 5)
+        self.assertEqual(rows[0]["title"], "Archive record")
+
+    def test_query_echo_detects_clue_stuffed_search_url(self):
+        from src.tools import _query_echo
+        item = {"url": "https://spam.test/search?q=unwanted+delivery+short+story+eyes"}
+        self.assertTrue(_query_echo(item, '"unwanted delivery" "short story" eyes 2023'))
 
     def test_docx_is_extracted_instead_of_treated_as_html(self):
         buffer = io.BytesIO()
@@ -102,6 +174,16 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn({"from": "entity:acme", "to": "k1", "type": "lead", "evidence_ids": ["c1"]}, graph["edges"])
         self.assertIn("candidate_condition_graph", notebook.prompt())
 
+    def test_builder_frontier_preserves_distinct_search_routes(self):
+        notebook = ResearchNotebook()
+        for route in ("rare person", "event archive"):
+            notebook.add_search_leads({route: {"_type": "SEARCH", "results": [
+                {"title": f"{route}-{i}", "snippet": "named bridge", "url": f"https://x/{route}/{i}",
+                 "query": route} for i in range(12)]}})
+        state = json.loads(notebook.prompt())
+        self.assertEqual({lead["query"] for lead in state["candidate_leads"]},
+                         {"rare person", "event archive"})
+
     def test_rejected_answer_is_persistent_falsification(self):
         notebook = ResearchNotebook()
         notebook.reject_answer("Wrong", "unsupported")
@@ -141,16 +223,66 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
         statuses = {item["condition_id"]: item["status"] for item in notebook.hypotheses[0]["coverage"]}
         self.assertEqual(statuses, {"k1": "lead", "k2": "verified"})
 
+    def test_grounded_inference_persists_and_covers_condition_as_derived(self):
+        notebook = ResearchNotebook()
+        notebook.set_conditions([{"id": "k1", "description": "event occurred three years later"}])
+        notebook.claims += [
+            {"id": "c1", "claim": "Event A occurred in 2007", "level": "verified", "source_id": "s1", "condition_ids": []},
+            {"id": "c2", "claim": "Event B occurred in 2010", "level": "verified", "source_id": "s2", "condition_ids": []},
+        ]
+        notebook.record_plan({
+            "inferences": [{"conclusion": "Event B occurred three years after Event A", "premise_ids": ["c1", "c2"],
+                            "condition_ids": ["k1"], "entities": ["Event B"]}],
+            "hypotheses": [{"entity": "Event B", "coverage": [{"condition_id": "k1", "evidence_ids": ["d1"]}]}],
+        })
+        self.assertEqual(notebook.inferences[0]["level"], "derived")
+        self.assertEqual(notebook.hypotheses[0]["coverage"][0]["status"], "derived")
+        claims, inferences = notebook.proof([], ["d1"])
+        self.assertEqual({item["id"] for item in claims}, {"c1", "c2"})
+        self.assertEqual([item["id"] for item in inferences], ["d1"])
+
+    def test_inference_cannot_use_search_lead_as_premise(self):
+        notebook = ResearchNotebook()
+        notebook.leads.append({"id": "c1", "claim": "snippet", "level": "lead", "source_id": "search"})
+        notebook.record_plan({"inferences": [{"conclusion": "invented join", "premise_ids": ["c1"]}]})
+        self.assertEqual(notebook.inferences, [])
+
+    def test_inference_rejects_partial_or_multi_condition_grounding(self):
+        notebook = ResearchNotebook()
+        notebook.set_conditions([{"id": "k1", "description": "one"}, {"id": "k2", "description": "two"}])
+        notebook.claims.append({"id": "c1", "claim": "fact", "level": "verified", "source_id": "s", "condition_ids": []})
+        notebook.record_plan({"inferences": [
+            {"conclusion": "uses a missing premise", "premise_ids": ["c1", "c404"], "condition_ids": ["k1"]},
+            {"conclusion": "overbroad", "premise_ids": ["c1"], "condition_ids": ["k1", "k2"]},
+        ]})
+        self.assertEqual(notebook.inferences, [])
+
+    def test_passage_is_centered_on_dense_query_match(self):
+        text = "intro " * 800 + "Four customers accounted for 72.8% of revenue in fiscal 2005." + " tail" * 800
+        passage, score = _passage(text, "four customers accounted 72.8")
+        self.assertGreater(score, 0)
+        self.assertIn("Four customers accounted for 72.8%", passage)
+        self.assertNotEqual(passage, text[:3000])
+
+    def test_compact_cards_preserves_each_query_route(self):
+        rows = ([{"query": "route a", "title": f"A{i}", "snippet": "x", "url": f"https://a/{i}"}
+                 for i in range(5)] +
+                [{"query": "route b", "title": f"B{i}", "snippet": "y", "url": f"https://b/{i}"}
+                 for i in range(5)])
+        cards = _compact_cards(rows, per_query=2)
+        self.assertEqual([item["query"] for item in cards], ["route a", "route b"])
+        self.assertEqual([len(item["results"]) for item in cards], [2, 2])
+
     async def test_solver_receives_same_stage_dependency_output(self):
         seen = {}
         async def fake_tool(_block, _observations=None): return {"_type": "FETCH", "text": "The answer is Ada."}
-        async def fake_audit(_q, _n, _o):
-            return {"claims": [{"claim": "The answer is Ada", "quote": "The answer is Ada", "source_id": "s1_page"}]}
         async def fake_solve(_q, _task, _role, notebook, observations):
             seen.update(observations)
-            return {"reasoning": "supported", "answer_candidate": "Ada", "support_claim_ids": [notebook.claims[0]["id"]]}
-        old = executor._tool, executor.audit_evidence, executor.solve_node
-        executor._tool, executor.audit_evidence, executor.solve_node = fake_tool, fake_audit, fake_solve
+            return {"reasoning": "supported", "answer_candidate": "Ada", "support_claim_ids": [],
+                    "claims": [{"claim": "The answer is Ada", "quote": "The answer is Ada",
+                                "source_id": "s1_page"}]}
+        old = executor._tool, executor.solve_node
+        executor._tool, executor.solve_node = fake_tool, fake_solve
         try:
             plan = {"blocks": [
                 {"id": "page", "type": "FETCH", "params": {"url": "https://example.com"}},
@@ -159,7 +291,7 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
             notebook = ResearchNotebook()
             outputs, _ = await executor.execute_stage("Who?", plan, notebook, 1)
         finally:
-            executor._tool, executor.audit_evidence, executor.solve_node = old
+            executor._tool, executor.solve_node = old
         self.assertIn("s1_page", seen)
         self.assertEqual(outputs["s1_solve"]["answer_candidate"], "Ada")
         self.assertEqual(notebook.claims[0]["level"], "verified")
@@ -184,6 +316,45 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outputs["s1_good"]["reasoning"], "ok")
         self.assertEqual(outputs["s1_join"]["reasoning"], "joined")
 
+    async def test_verifier_consumes_dependency_best_guess_not_placeholder(self):
+        seen = {}
+        async def fake_solve(*_args):
+            return {"memo": "ranked", "best_guess": "Ada", "candidates": []}
+        async def fake_verify(_q, candidate, *_args):
+            seen["candidate"] = candidate
+            return {"accepted": True, "reason": "supported"}
+        old = executor.solve_node, executor.verify_answer
+        executor.solve_node, executor.verify_answer = fake_solve, fake_verify
+        try:
+            outputs, _ = await executor.execute_stage("Who?", {"blocks": [
+                {"id": "solve", "type": "SOLVE", "params": {}},
+                {"id": "verify", "type": "VERIFY", "params": {"candidate": "best candidate from solver"},
+                 "depends_on": ["solve"]},
+            ]}, ResearchNotebook(), 1)
+        finally:
+            executor.solve_node, executor.verify_answer = old
+        self.assertEqual(seen["candidate"], "Ada")
+        self.assertTrue(outputs["s1_verify"]["accepted"])
+
+    async def test_browse_leads_do_not_require_an_auditor(self):
+        async def fake_tool(_block, _observations=None):
+            return {"_type": "BROWSE", "results": [{"title": "Named candidate", "snippet": "useful lead",
+                                                        "url": "https://example.com"}], "pages": []}
+        async def fake_solve(*_args): return {"reasoning": "continued", "answer_candidate": "", "hypotheses": []}
+        old = executor._tool, executor.solve_node
+        executor._tool, executor.solve_node = fake_tool, fake_solve
+        notebook = ResearchNotebook()
+        try:
+            outputs, _ = await executor.execute_stage("Who?", {"blocks": [
+                {"id": "web", "type": "BROWSE", "params": {"queries": ["x"]}},
+                {"id": "solve", "type": "SOLVE", "params": {}, "depends_on": ["web"]},
+            ]}, notebook, 1)
+        finally:
+            executor._tool, executor.solve_node = old
+        self.assertEqual(outputs["s1_solve"]["reasoning"], "continued")
+        self.assertEqual(len(notebook.leads), 1)
+        self.assertNotIn("AUDIT", {node["kind"] for node in notebook.graph})
+
     async def test_research_builds_a_new_graph_each_stage(self):
         stages = []
         async def fake_build(_q, _n, stage, _max):
@@ -191,46 +362,42 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
             return {"objective": f"stage {stage}", "blocks": [{"id": "solve", "type": "SOLVE", "params": {}}]}
         async def fake_execute(_q, _p, _n, stage, _build):
             return {f"s{stage}_solve": {"answer_candidate": "Ada", "support_claim_ids": []}}, []
-        async def fake_verify(*_args): return {"accepted": len(stages) == 2, "reason": "continue"}
-        old = research_module.build_stage, research_module.execute_stage, research_module.verify_answer
-        research_module.build_stage, research_module.execute_stage, research_module.verify_answer = fake_build, fake_execute, fake_verify
+        old = research_module.build_stage, research_module.execute_stage
+        research_module.build_stage, research_module.execute_stage = fake_build, fake_execute
         try:
             result = await research_module.research("Who?", 3)
         finally:
-            research_module.build_stage, research_module.execute_stage, research_module.verify_answer = old
-        self.assertEqual(stages, [1, 2])
+            research_module.build_stage, research_module.execute_stage = old
+        self.assertEqual(stages, [1, 2, 3])
         self.assertEqual(result["answer"], "ANSWER: Ada")
-        self.assertEqual([node["kind"] for node in result["research_state"]["graph"]], ["BUILD", "VERIFY", "BUILD", "VERIFY"])
+        self.assertEqual([node["kind"] for node in result["research_state"]["graph"]], ["BUILD", "BUILD", "BUILD"])
 
-    async def test_rejected_candidate_is_not_returned_as_fallback(self):
+    async def test_best_guess_is_returned_even_without_verification(self):
         async def fake_build(_q, _n, stage, _max):
             return {"objective": str(stage), "blocks": [{"id": "solve", "type": "SOLVE", "params": {}}]}
         async def fake_execute(_q, _p, _n, stage, _build):
             return {f"s{stage}_solve": {"answer_candidate": "Wrong", "support_claim_ids": []}}, []
-        async def fake_verify(*_args): return {"accepted": False, "reason": "unsupported"}
-        old = research_module.build_stage, research_module.execute_stage, research_module.verify_answer
-        research_module.build_stage, research_module.execute_stage, research_module.verify_answer = fake_build, fake_execute, fake_verify
+        old = research_module.build_stage, research_module.execute_stage
+        research_module.build_stage, research_module.execute_stage = fake_build, fake_execute
         try:
             result = await research_module.research("Who?", 1)
         finally:
-            research_module.build_stage, research_module.execute_stage, research_module.verify_answer = old
-        self.assertEqual(result["answer"], "NEEDS_EVIDENCE: no supported answer candidate")
+            research_module.build_stage, research_module.execute_stage = old
+        self.assertEqual(result["answer"], "ANSWER: Wrong")
 
-    async def test_verifier_failure_cannot_leak_unverified_candidate(self):
+    async def test_builder_best_guess_survives_a_tool_only_stage(self):
         async def fake_build(_q, _n, stage, _max):
-            return {"objective": str(stage), "conditions": [{"id": "k1", "description": "answer"}],
-                    "blocks": [{"id": "solve", "type": "SOLVE", "params": {}}]}
+            return {"objective": str(stage), "best_guess": "Intermediate Anchor",
+                    "blocks": [{"id": "search", "type": "SEARCH", "params": {}}]}
         async def fake_execute(_q, _p, _n, stage, _build):
-            return {f"s{stage}_solve": {"answer_candidate": "Intermediate Anchor", "support_claim_ids": []}}, []
-        async def fake_verify(*_args): raise RuntimeError("verifier failed")
-        old = research_module.build_stage, research_module.execute_stage, research_module.verify_answer
-        research_module.build_stage, research_module.execute_stage, research_module.verify_answer = fake_build, fake_execute, fake_verify
+            return {f"s{stage}_search": {"_type": "SEARCH", "results": []}}, []
+        old = research_module.build_stage, research_module.execute_stage
+        research_module.build_stage, research_module.execute_stage = fake_build, fake_execute
         try:
             result = await research_module.research("Who?", 1)
         finally:
-            research_module.build_stage, research_module.execute_stage, research_module.verify_answer = old
-        self.assertEqual(result["answer"], "")
-        self.assertIn("verifier failed", result["error"])
+            research_module.build_stage, research_module.execute_stage = old
+        self.assertEqual(result["answer"], "ANSWER: Intermediate Anchor")
 
     def test_calculate_is_restricted(self):
         self.assertEqual(calculate("ceil(1037 * 0.04)")["value"], 42)
@@ -264,6 +431,46 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(notebook.stage_summaries[0]["stage"], 3)
         self.assertEqual(notebook.stage_summaries[-1]["stage"], 6)
 
+    def test_action_ledger_exposes_zero_gain_retrieval_to_next_builder(self):
+        notebook = ResearchNotebook()
+        notebook.record_actions(1, {
+            "focus_condition_ids": ["k2"],
+            "blocks": [{"type": "SEARCH", "params": {"queries": ["rare phrase"]}},
+                       {"type": "FETCH", "params": {"url": "https://example.com/page"}}],
+        }, {}, information_gain=0)
+        state = notebook.prompt()
+        self.assertIn('"information_gain": 0', state)
+        self.assertIn('"rare phrase"', state)
+        self.assertIn('"k2"', state)
+
+    def test_solver_state_excludes_search_lead_noise(self):
+        notebook = ResearchNotebook()
+        notebook.leads.append({"id": "c1", "claim": "SEO noise", "level": "lead", "source_id": "s"})
+        self.assertNotIn("SEO noise", notebook.solver_state())
+
+    def test_candidate_memory_preserves_ranked_adviser_candidates(self):
+        notebook = ResearchNotebook()
+        notebook.record_candidates(2, {"best_guess": "Ada", "candidates": [
+            {"name": "Ada", "status": "supported", "why": "two direct sources"},
+            {"name": "Grace", "status": "plausible", "why": "date unresolved"},
+        ]})
+        state = notebook.prompt()
+        self.assertIn('"name": "Ada"', state)
+        self.assertIn('"last_best_stage": 2', state)
+        self.assertIn('"name": "Grace"', state)
+
+    async def test_builder_can_end_before_stage_limit_with_best_guess(self):
+        async def fake_build(*_args):
+            return {"decision": "answer", "best_guess": "Ada", "objective": "stop", "blocks": []}
+        old = research_module.build_stage
+        research_module.build_stage = fake_build
+        try:
+            result = await research_module.research("Who?", 8)
+        finally:
+            research_module.build_stage = old
+        self.assertEqual(result["answer"], "ANSWER: Ada")
+        self.assertEqual(result["stages"], 1)
+
     def test_verifier_rejected_candidates_recorded_in_summary(self):
         notebook = ResearchNotebook()
         notebook.record_stage_summary(1, new_verified=0, new_leads=5,
@@ -288,6 +495,7 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
         notebook.record_stage_summary(1, new_verified=1, new_leads=3,
                                        successful_pages=1, failed_fetches=0, candidate_changes=0)
         state = notebook.to_dict()
+        self.assertEqual(state["stage_summaries"][0]["new_verified_claims"], 1)
         # to_dict should not crash; verify it has the core fields
         for key in ("claims", "leads", "hypotheses", "conditions", "sources",
                     "rejected_answers", "evidence_graph", "graph"):

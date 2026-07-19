@@ -15,10 +15,13 @@ def _items(value):
 class ResearchNotebook:
     def __init__(self):
         self.claims, self.leads = [], []
+        self.inferences = []
         self.hypotheses, self.questions, self.reasoning, self.rejected_answers = [], [], [], []
         self.conditions, self.entities, self.sources = [], {}, {}
         self.graph, self.answer = [], ""
-        self.stage_summaries = []
+        self.stage_summaries, self.action_ledger, self.builder_history = [], [], []
+        self.candidate_memory = {}
+        self.adviser_history, self.verification_history = [], []
 
     def add_node(self, kind, payload, depends_on=()):
         node_id = f"n{len(self.graph) + 1}"
@@ -28,6 +31,10 @@ class ResearchNotebook:
     def _claim_id(self):
         numbers = [int(item["id"][1:]) for item in self.claims + self.leads if str(item.get("id", "")).startswith("c")]
         return f"c{max(numbers, default=0) + 1}"
+
+    def _inference_id(self):
+        numbers = [int(item["id"][1:]) for item in self.inferences if str(item.get("id", "")).startswith("d")]
+        return f"d{max(numbers, default=0) + 1}"
 
     def set_conditions(self, conditions):
         if self.conditions or not isinstance(conditions, list):
@@ -133,7 +140,7 @@ class ResearchNotebook:
         known = {(item.get("url"), _text(item.get("claim")).lower()) for item in self.leads}
         added = []
         for source, output in outputs.items():
-            if output.get("_type") != "BROWSE":
+            if output.get("_type") not in {"SEARCH", "BROWSE"}:
                 continue
             self.sources[source] = {"type": "BROWSE", "urls": [item.get("url", "") for item in _items(output.get("results"))[:20]]}
             for item in _items(output.get("results"))[:12]:
@@ -154,6 +161,31 @@ class ResearchNotebook:
         if analysis:
             self.reasoning.append(analysis)
             self.reasoning = self.reasoning[-4:]
+        known = {item["id"] for item in self.claims + self.inferences}
+        valid_conditions = {item["id"] for item in self.conditions}
+        existing = {(_text(item.get("conclusion")).lower(), tuple(item.get("premise_ids", []))) for item in self.inferences}
+        for item in _items(plan.get("inferences")):
+            if not isinstance(item, dict):
+                continue
+            conclusion = _text(item.get("conclusion"))
+            requested = list(dict.fromkeys(_text(value) for value in _items(item.get("premise_ids")) if _text(value)))
+            premises = [value for value in requested if value in known]
+            key = (conclusion.lower(), tuple(premises))
+            if not conclusion or not premises or len(premises) != len(requested) or key in existing:
+                continue
+            condition_ids = [_text(value) for value in _items(item.get("condition_ids"))
+                             if _text(value) in valid_conditions]
+            if len(set(condition_ids)) > 1:
+                continue
+            self.inferences.append({
+                "id": self._inference_id(), "conclusion": conclusion, "premise_ids": premises,
+                "condition_ids": list(dict.fromkeys(condition_ids)),
+                "entities": list(dict.fromkeys(_text(value) for value in _items(item.get("entities")) if _text(value))),
+                "level": "derived",
+            })
+            known.add(self.inferences[-1]["id"])
+            existing.add(key)
+        self.inferences = self.inferences[-40:]
         if isinstance(plan.get("hypotheses"), list):
             merged = {_text(item.get("entity")).lower(): item for item in self.hypotheses if isinstance(item, dict) and _text(item.get("entity"))}
             for item in plan["hypotheses"]:
@@ -164,14 +196,15 @@ class ResearchNotebook:
                 canonical = next((key for key, old in merged.items()
                                   if names & {key, *(_text(alias).lower() for alias in _items(old.get("aliases")))}),
                                  entity.lower())
-                evidence = {x["id"]: x for x in self.claims + self.leads}
+                evidence = {x["id"]: x for x in self.claims + self.leads + self.inferences}
                 coverage = []
                 for cover in _items(item.get("coverage")):
                     if not isinstance(cover, dict) or not _text(cover.get("condition_id")): continue
                     condition_id = _text(cover["condition_id"])
                     ids = [x for x in _items(cover.get("evidence_ids")) if x in evidence]
                     verified = any(evidence[x]["level"] == "verified" and condition_id in evidence[x].get("condition_ids", []) for x in ids)
-                    status = "verified" if verified else "lead" if ids else "unknown"
+                    derived = any(evidence[x]["level"] == "derived" and condition_id in evidence[x].get("condition_ids", []) for x in ids)
+                    status = "verified" if verified else "derived" if derived else "lead" if ids else "unknown"
                     if cover.get("status") == "contradicted": status = "contradicted"
                     coverage.append({"condition_id": condition_id, "status": status, "evidence_ids": ids})
                 current = merged.get(canonical, {})
@@ -216,34 +249,143 @@ class ResearchNotebook:
         })
         self.stage_summaries = self.stage_summaries[-4:]
 
+    def record_actions(self, stage, plan, outputs, information_gain):
+        """Remember attempted retrievals so the next Builder chooses a new action."""
+        for block in (plan.get("blocks") or []):
+            if not isinstance(block, dict) or str(block.get("type", "")).upper() not in {"SEARCH", "BROWSE", "FETCH", "READ_PDF"}:
+                continue
+            params = block.get("params") or {}
+            targets = params.get("queries", params.get("urls", params.get("url", [])))
+            targets = targets if isinstance(targets, list) else [targets]
+            self.action_ledger.append({
+                "stage": stage, "type": str(block.get("type", "")).upper(),
+                "targets": [_text(item) for item in targets if _text(item)][:8],
+                "focus": [_text(item) for item in (plan.get("focus_condition_ids") or []) if _text(item)],
+                "information_gain": information_gain,
+            })
+        self.action_ledger = self.action_ledger[-24:]
+
+    def record_builder(self, stage, plan):
+        self.builder_history.append({
+            "stage": stage,
+            "objective": _text(plan.get("objective")),
+            "decision": _text(plan.get("decision")) or "continue",
+            "best_guess": _text(plan.get("best_guess")),
+            "focus_condition_ids": [_text(x) for x in _items(plan.get("focus_condition_ids")) if _text(x)],
+            "expected_observation": _text(plan.get("expected_observation")),
+            "rationale": _text(plan.get("rationale")),
+        })
+        self.builder_history = self.builder_history[-4:]
+
+    def record_candidates(self, stage, report):
+        for item in _items(report.get("candidates")):
+            if not isinstance(item, dict): continue
+            name = _text(item.get("name"))
+            if not name: continue
+            key = name.lower()
+            old = self.candidate_memory.get(key, {"name": name})
+            old.update({"status": _text(item.get("status")) or old.get("status", "plausible"),
+                        "why": _text(item.get("why")) or old.get("why", ""),
+                        "last_updated_stage": stage})
+            self.candidate_memory[key] = old
+        guess = _text(report.get("best_guess"))
+        if guess:
+            key = guess.lower()
+            self.candidate_memory.setdefault(key, {"name": guess, "status": "plausible", "why": ""})
+            self.candidate_memory[key]["last_best_stage"] = stage
+        self.adviser_history.append({
+            "stage": stage, "best_guess": guess,
+            "decisive_gap": _text(report.get("decisive_gap")),
+            "recommendation": _text(report.get("recommendation")),
+            "memo": _text(report.get("memo"))[:800],
+        })
+        self.adviser_history = self.adviser_history[-3:]
+
+    def record_verification(self, stage, candidate, verdict):
+        record = {"stage": stage, "candidate": _text(candidate),
+                  "accepted": bool(verdict.get("accepted")),
+                  "reason": _text(verdict.get("reason"))[:1000]}
+        self.verification_history.append(record)
+        self.verification_history = self.verification_history[-3:]
+        if not record["accepted"] and record["reason"]:
+            self.questions = (self.questions + [record["reason"]])[-12:]
+
+    def solver_state(self):
+        """Compact proof state; raw retrieval observations are supplied separately."""
+        return json.dumps({
+            "conditions": self.conditions,
+            "verified_claims": self.claims[-20:],
+            "candidate_condition_graph": self.hypotheses[-12:],
+            "candidate_memory": list(self.candidate_memory.values())[-16:],
+            "decisive_gaps": self.questions[-6:],
+            "rejected_answers": self.rejected_answers[-8:],
+        }, ensure_ascii=False)
+
     def prompt(self):
         referenced = {evidence for item in self.hypotheses for cover in _items(item.get("coverage"))
                       for evidence in _items(cover.get("evidence_ids"))}
         selected = [item for item in self.leads if item["id"] in referenced]
-        selected += [item for item in self.leads[-30:] if item not in selected]
+        # Keep the retrieval frontier route-diverse. A later broad SEARCH must not
+        # evict every intermediate entity found by an earlier route.
+        recent, seen_queries = [], set()
+        for item in reversed(self.leads):
+            query = _text(item.get("query")) or f"source:{item.get('source_id', '')}"
+            if query in seen_queries:
+                continue
+            seen_queries.add(query)
+            recent.append(item)
+            if len(recent) >= 12:
+                break
+        selected += [item for item in reversed(recent) if item not in selected]
         last_stage = self.stage_summaries[-1] if self.stage_summaries else None
+        verified_by_candidate = {
+            item.get("entity", ""): len({cover.get("condition_id") for cover in _items(item.get("coverage"))
+                                         if cover.get("status") in {"verified", "derived"}})
+            for item in self.hypotheses
+        }
+        proof_threshold = max(2, (len(self.conditions) + 1) // 2)
+        recent_guesses = [item.get("best_guess", "") for item in self.builder_history if item.get("best_guess")]
+        stable_guess = recent_guesses[-1] if len(recent_guesses) >= 2 and recent_guesses[-1] == recent_guesses[-2] else ""
         return json.dumps({
             "source_policy": "search_leads are untrusted navigation hints, never facts; ignore query echoes, unrelated domains, and snippets without a concrete named entity",
             "candidate_policy": "hypotheses contain concrete named entities only; any candidate contradicting a required condition is pruned and must not drive confirmation search",
-            "conditions": self.conditions, "verified_claims": self.claims[-50:], "search_leads": selected[-40:],
-            "candidate_condition_graph": self.hypotheses, "open_questions": self.questions,
+            "conditions": self.conditions, "verified_claims": self.claims[-24:],
+            "derived_inferences": self.inferences[-16:], "candidate_leads": selected[-12:],
+            "candidate_condition_graph": self.hypotheses[-12:], "decisive_gaps": self.questions[-6:],
+            "candidate_memory": list(self.candidate_memory.values())[-16:],
+            "candidate_search_control": {
+                "verified_conditions_by_candidate": verified_by_candidate,
+                "proof_threshold_before_narrowing": proof_threshold,
+                "exploration_required": max(verified_by_candidate.values(), default=0) < proof_threshold,
+            },
             "rejected_answers": self.rejected_answers,
-            "recent_reasoning": self.reasoning,
             "last_stage": last_stage,
-            "graph_tail": [{key: node.get(key) for key in ("id", "kind", "depends_on", "goal", "claim_ids") if key in node}
-                           for node in self.graph[-20:]],
+            "recent_builder_decisions": self.builder_history,
+            "recent_adviser_reports": self.adviser_history,
+            "recent_verifications": self.verification_history,
+            "stop_guidance": {
+                "stable_best_guess": stable_guess,
+                "rule": "answer when the same candidate leads for two decisions and no live alternative has evidence likely to overtake it; unresolved confidence-only details do not justify another stage",
+            },
+            "failed_or_completed_actions": self.action_ledger[-12:],
         }, ensure_ascii=False, indent=2)
 
     def evidence_graph(self):
         nodes = ([{"id": x["id"], "type": "condition", "label": x["description"]} for x in self.conditions] +
                  [{"id": f"entity:{key}", "type": "entity", "label": value["name"]} for key, value in self.entities.items()] +
                  [{"id": x["id"], "type": "claim", "label": x["claim"], "level": x["level"]} for x in self.claims + self.leads] +
+                 [{"id": x["id"], "type": "inference", "label": x["conclusion"], "level": "derived"} for x in self.inferences] +
                  [{"id": f"source:{key}", "type": "source", **value} for key, value in self.sources.items()])
         edges = []
         for claim in self.claims + self.leads:
             edges.append({"from": claim["id"], "to": f"source:{claim['source_id']}", "type": "supported_by", "level": claim["level"]})
             edges += [{"from": claim["id"], "to": condition, "type": "addresses"} for condition in claim.get("condition_ids", [])]
             edges += [{"from": f"entity:{entity.lower()}", "to": claim["id"], "type": "mentioned_in"} for entity in claim.get("entities", [])]
+        for inference in self.inferences:
+            edges += [{"from": premise, "to": inference["id"], "type": "premise_of"} for premise in inference["premise_ids"]]
+            edges += [{"from": inference["id"], "to": condition, "type": "derives"} for condition in inference.get("condition_ids", [])]
+            edges += [{"from": f"entity:{entity.lower()}", "to": inference["id"], "type": "inferred_about"}
+                      for entity in inference.get("entities", [])]
         for hypothesis in self.hypotheses:
             entity = f"entity:{hypothesis['entity'].lower()}"
             edges += [{"from": entity, "to": item["condition_id"], "type": item.get("status", "unknown"),
@@ -252,10 +394,30 @@ class ResearchNotebook:
 
     def to_dict(self):
         return {
-            "claims": self.claims, "leads": self.leads, "hypotheses": self.hypotheses,
+            "claims": self.claims, "leads": self.leads, "inferences": self.inferences, "hypotheses": self.hypotheses,
             "conditions": self.conditions, "entities": self.entities, "sources": self.sources,
             "rejected_answers": self.rejected_answers,
             "evidence_graph": self.evidence_graph(),
             "open_questions": self.questions, "reasoning": self.reasoning,
-            "graph": self.graph, "verified_answer": self.answer,
+            "graph": self.graph, "stage_summaries": self.stage_summaries, "verified_answer": self.answer,
+            "action_ledger": self.action_ledger, "builder_history": self.builder_history,
+            "candidate_memory": list(self.candidate_memory.values()),
+            "adviser_history": self.adviser_history,
+            "verification_history": self.verification_history,
         }
+
+    def proof(self, claim_ids, inference_ids):
+        """Return a closed proof subgraph rooted at the Solver-cited evidence."""
+        claims = {item["id"]: item for item in self.claims}
+        inferences = {item["id"]: item for item in self.inferences}
+        wanted_claims, wanted_inferences = set(), set()
+        stack = [value for value in list(claim_ids) + list(inference_ids) if value]
+        while stack:
+            item_id = stack.pop()
+            if item_id in claims:
+                wanted_claims.add(item_id)
+            elif item_id in inferences and item_id not in wanted_inferences:
+                wanted_inferences.add(item_id)
+                stack.extend(inferences[item_id].get("premise_ids", []))
+        return ([claims[item_id] for item_id in wanted_claims],
+                [inferences[item_id] for item_id in wanted_inferences])

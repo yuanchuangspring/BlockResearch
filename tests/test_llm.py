@@ -23,9 +23,11 @@ class FakeCompletions:
 class LLMTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.old_client = llm._client
+        self.old_new_client = llm._new_client
 
     def tearDown(self):
         llm._client = self.old_client
+        llm._new_client = self.old_new_client
 
     async def test_reasoning_is_not_used_as_the_final_answer(self):
         completions = FakeCompletions([

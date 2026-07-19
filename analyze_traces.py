@@ -33,12 +33,13 @@ def diagnose_trace(case: dict) -> dict:
     verified_by_stage = {}
     max_consecutive_zero = 0
     current_zero_run = 0
-    for stage_idx in range(1, len(trace) + 2):
+    stage_numbers = [item.get("stage") for item in trace if isinstance(item.get("stage"), int)]
+    for stage_idx in stage_numbers:
         accepted = audit_by_stage.get(stage_idx, {}).get("accepted", 0)
         verified_by_stage[stage_idx] = accepted
         if first_verified_stage is None and accepted > 0:
             first_verified_stage = stage_idx
-        if accepted == 0 and audit_by_stage.get(stage_idx, {}).get("proposed", 0) >= 0:
+        if accepted == 0:
             current_zero_run += 1
             max_consecutive_zero = max(max_consecutive_zero, current_zero_run)
         else:
@@ -76,7 +77,10 @@ def diagnose_trace(case: dict) -> dict:
                 continue
             output = node.get("output") or {}
             candidate = str(output.get("answer_candidate", "")).strip()
-            if candidate and candidate.lower() not in {"none", "no match", "no match found", "not found", "n/a", ""}:
+            named_hypotheses = [item for item in _safe_list(output.get("hypotheses"))
+                                if isinstance(item, dict) and str(item.get("entity", "")).strip()]
+            if ((candidate and candidate.lower() not in {"none", "no match", "no match found", "not found", "n/a", ""})
+                    or named_hypotheses):
                 first_named_candidate_stage = stage_data.get("stage")
                 break
         if first_named_candidate_stage:

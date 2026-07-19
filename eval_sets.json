@@ -1,0 +1,5 @@
+{
+  "development": [20, 650, 1079, 1090, 1193],
+  "isolated_blind": [101, 305, 555, 777, 1001],
+  "policy": "Development cases are previously inspected. Never decrypt, print, or save question/answer/trajectory content for isolated_blind cases; run them only with --blind."
+}
