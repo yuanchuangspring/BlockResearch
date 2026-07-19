@@ -2,8 +2,6 @@
   <img src="static/title.png" alt="BlockResearch" height="48">
 </p>
 
-<h1 align="center">BlockResearch</h1>
-
 <p align="center">
   <a href="README_CN.md">中文</a>
 </p>
