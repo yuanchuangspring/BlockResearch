@@ -1,23 +1,21 @@
-<p align="center">
-  <img src="static/title.png" alt="BlockResearch" height="48">
-</p>
+<div align="center">
 
-<p align="center">
-  <a href="README.md">English</a>
-</p>
+<img src="static/title.png" alt="BlockResearch" height="56">
 
-<p align="center">
-  <em>边研究，边搭建 —— 逐阶段动态图构造，证据驱动的深度研究框架</em>
-</p>
+<em>边研究，边搭建 —— 逐阶段动态图构造，证据驱动的深度研究框架</em>
 
-<p align="center">
-  <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.10+-blue?style=flat-square" alt="Python"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License"></a>
-</p>
+[![GitHub Stars](https://img.shields.io/github/stars/yuanchuangspring/BlockResearch?style=flat-square)](https://github.com/yuanchuangspring/BlockResearch/stargazers)
+[![GitHub Forks](https://img.shields.io/github/forks/yuanchuangspring/BlockResearch?style=flat-square)](https://github.com/yuanchuangspring/BlockResearch/network)
+[![GitHub Issues](https://img.shields.io/github/issues/yuanchuangspring/BlockResearch?style=flat-square)](https://github.com/yuanchuangspring/BlockResearch/issues)
 
-<p align="center">
-  <img src="static/%E5%9B%BE%E7%89%871.png" alt="BlockResearch 概念图" width="680">
-</p>
+[![Python](https://img.shields.io/badge/python-3.10+-blue?style=flat-square)](https://www.python.org/)
+[![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)](LICENSE)
+
+<img src="static/%E5%9B%BE%E7%89%871.png" alt="BlockResearch 概念图" width="680">
+
+[English](./README.md) | [中文文档](./README_CN.md)
+
+</div>
 
 ---
 

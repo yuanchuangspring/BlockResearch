@@ -1,20 +1,21 @@
-<p align="center">
-  <img src="static/title.png" alt="BlockResearch" height="48">
-</p>
+<div align="center">
 
-<p align="center">
-  <em>Research While Building — Stage-wise dynamic graph construction for evidence-grounded deep research</em>
-</p>
+<img src="static/title.png" alt="BlockResearch" height="56">
 
-<p align="center">
-  <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.10+-blue?style=flat-square" alt="Python"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License"></a>
-  <a href="README_CN.md">中文</a>
-</p>
+<em>Research While Building — Stage-wise dynamic graph construction for evidence-grounded deep research</em>
 
-<p align="center">
-  <img src="static/%E5%9B%BE%E7%89%871.png" alt="BlockResearch Concept" width="680">
-</p>
+[![GitHub Stars](https://img.shields.io/github/stars/yuanchuangspring/BlockResearch?style=flat-square)](https://github.com/yuanchuangspring/BlockResearch/stargazers)
+[![GitHub Forks](https://img.shields.io/github/forks/yuanchuangspring/BlockResearch?style=flat-square)](https://github.com/yuanchuangspring/BlockResearch/network)
+[![GitHub Issues](https://img.shields.io/github/issues/yuanchuangspring/BlockResearch?style=flat-square)](https://github.com/yuanchuangspring/BlockResearch/issues)
+
+[![Python](https://img.shields.io/badge/python-3.10+-blue?style=flat-square)](https://www.python.org/)
+[![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)](LICENSE)
+
+<img src="static/%E5%9B%BE%E7%89%871.png" alt="BlockResearch Concept" width="680">
+
+[English](./README.md) | [中文文档](./README_CN.md)
+
+</div>
 
 ---
 
