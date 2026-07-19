@@ -13,8 +13,6 @@
 
 </div>
 
----
-
 ## Why BlockResearch?
 
 Large language models have enabled a new class of deep research agents that autonomously search the web, read sources, and synthesize answers to complex open-domain questions. But most of these agents share a fundamental flaw: **they decide the structure of research before it begins.**
