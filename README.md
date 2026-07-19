@@ -3,16 +3,13 @@
 </p>
 
 <p align="center">
-  <a href="README_CN.md">中文</a>
-</p>
-
-<p align="center">
   <em>Research While Building — Stage-wise dynamic graph construction for evidence-grounded deep research</em>
 </p>
 
 <p align="center">
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.10+-blue?style=flat-square" alt="Python"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License"></a>
+  <a href="README_CN.md">中文</a>
 </p>
 
 <p align="center">
