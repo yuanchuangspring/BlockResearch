@@ -7,9 +7,9 @@
 [![Python](https://img.shields.io/badge/python-3.10+-blue?style=flat-square)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)](LICENSE)
 
-<img src="static/%E5%9B%BE%E7%89%871.png" alt="BlockResearch 概念图" width="680">
-
 [English](./README.md) | [中文文档](./README_CN.md)
+
+<img src="static/%E5%9B%BE%E7%89%871.png" alt="BlockResearch 概念图" width="680">
 
 </div>
 
