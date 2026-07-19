@@ -13,8 +13,45 @@ from urllib.parse import unquote, urljoin, urlparse, urlunparse
 
 import httpx
 from dotenv import load_dotenv
+from .runtime import env
+from .recorder import record
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
+
+_brave_client = None
+_brave_gate = asyncio.Semaphore(4)
+
+
+def _get_brave_client():
+    global _brave_client
+    if _brave_client is None or _brave_client.is_closed:
+        _brave_client = httpx.AsyncClient(timeout=20, follow_redirects=True)
+    return _brave_client
+
+
+async def _brave_get(query, count):
+    """Reuse connections and retry only timeouts, network errors, 429 and 5xx."""
+    for attempt in range(1, 4):
+        try:
+            async with _brave_gate:
+                response = await _get_brave_client().get(
+                    "https://api.search.brave.com/res/v1/web/search",
+                    params={"q": query, "count": count, "extra_snippets": "true"},
+                    headers={"X-Subscription-Token": env("BRAVE_API_KEY"), "Accept": "application/json"})
+            if response.status_code == 429 or response.status_code >= 500:
+                raise httpx.HTTPStatusError(f"HTTP {response.status_code}", request=response.request, response=response)
+            response.raise_for_status()
+            return response
+        except (httpx.TimeoutException, httpx.NetworkError, httpx.HTTPStatusError) as exc:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            transient = status is None or status == 429 or status >= 500
+            if not transient or attempt == 3:
+                raise
+            detail = str(exc).strip() or str(status or "network error")
+            record("search_retry", backend="brave", query=query, attempt=attempt,
+                   error=f"{type(exc).__name__}: {detail}")
+            print(f"[BRAVE RETRY] attempt {attempt}/3: {type(exc).__name__} {status or ''}", flush=True)
+            await asyncio.sleep(attempt)
 
 
 def _canonical_url(url):
@@ -57,7 +94,7 @@ def _merge_results(batches, query, limit):
 
 
 def _web_headers(url):
-    agent = (os.environ.get("SEC_USER_AGENT", "BlockResearch academic research blockresearch@example.com")
+    agent = (env("SEC_USER_AGENT", "BlockResearch academic research blockresearch@example.com")
              if "sec.gov" in urlparse(url).netloc else "Mozilla/5.0 BlockResearch/3.0")
     return {"User-Agent": agent, "Accept": "text/html,application/xhtml+xml,application/pdf;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.8"}
@@ -122,50 +159,35 @@ def _passage(text, search, window=3000):
 
 
 def _expand_queries(queries):
-    compiled = []
-    for raw in queries:
-        query = " ".join(str(raw).split())
-        if not query: continue
-        quoted = re.findall(r'"([^"]+)"', query)
-        if len(quoted) <= 2:
-            compiled.append(query)
-            continue
-        # Split keyword bags into two source-shaped retrieval attempts.
-        compiled.append(f'"{quoted[0]}" "{quoted[1]}"')
-        context = " ".join(re.findall(r"\b[A-Za-z0-9-]+\b", re.sub(r'"[^"]+"', "", query))[:3])
-        if re.search(r"[A-Za-z]{3}", quoted[2]) and context:
-            compiled.append(f'"{quoted[2]}" {context}')
-    return list(dict.fromkeys(compiled))[:16]
+    """Normalize and deduplicate only; never rewrite retrieval semantics."""
+    return list(dict.fromkeys(" ".join(str(raw).split()) for raw in queries
+                              if " ".join(str(raw).split())))[:16]
 
 
 async def search(query: str, n: int = 5) -> dict:
     if not query.strip():
         return {"error": "empty query", "results": []}
-    if not os.environ.get("BRAVE_API_KEY"):
+    if not env("BRAVE_API_KEY"):
         return {"error": "BRAVE_API_KEY is not configured", "results": []}
     try:
         count = min(max(int(n), 1), 20)
-        async def request(client, value):
-            response = await client.get(
-                "https://api.search.brave.com/res/v1/web/search",
-                params={"q": value, "count": count, "extra_snippets": "true"},
-                headers={"X-Subscription-Token": os.environ["BRAVE_API_KEY"], "Accept": "application/json"})
-            response.raise_for_status()
+        async def request(value):
+            response = await _brave_get(value, count)
             rows = []
             for item in (response.json().get("web") or {}).get("results", []):
                 excerpts = [item.get("description", ""), *(item.get("extra_snippets") or [])]
                 rows.append({"title": item.get("title", ""), "url": item.get("url", ""),
                              "snippet": " ".join(x for x in excerpts if x)[:1000]})
             return rows
-        async with httpx.AsyncClient(timeout=20) as client:
-            exact = await request(client, query)
-            relaxed_query = re.sub(r'"([^"]+)"', r"\1", query)
-            relaxed = await request(client, relaxed_query) if relaxed_query != query and len(exact) < max(3, count // 2) else []
+        exact = await request(query)
+        relaxed_query = re.sub(r'"([^"]+)"', r"\1", query)
+        relaxed = await request(relaxed_query) if relaxed_query != query and len(exact) < max(3, count // 2) else []
         batches = [("brave", exact)] + ([("brave_relaxed", relaxed)] if relaxed else [])
         return {"results": _merge_results(batches, query, count),
                 "backend": "brave"}
     except Exception as exc:
-        return {"error": f"brave: {exc}", "results": []}
+        detail = str(exc).strip() or type(exc).__name__
+        return {"error": f"brave {type(exc).__name__}: {detail}", "results": []}
 
 
 async def browse(queries, n=5, fetch_per_query=1, search_terms="") -> dict:
@@ -202,6 +224,8 @@ async def browse(queries, n=5, fetch_per_query=1, search_terms="") -> dict:
     value = {"queries": queries, "results": results[:30], "pages": pages}
     if errors:
         value["search_errors"] = errors[:5]
+        if not results:
+            value["error"] = "; ".join(dict.fromkeys(errors))
     return value
 
 
@@ -235,8 +259,11 @@ async def search_many(queries, n=5) -> dict:
                 domains[domain] = domains.get(domain, 0) + 1
                 results.append({**item, "query": query, "rank": rank + 1})
     errors = [batch.get("error") for batch in batches if batch.get("error")]
-    value = {"queries": queries, "results": results[:40]}
-    if errors: value["search_errors"] = errors[:5]
+    value = {"queries": queries, "results": results[:min(100, len(queries) * max_rank)]}
+    if errors:
+        value["search_errors"] = errors[:5]
+        if not results:
+            value["error"] = "; ".join(dict.fromkeys(errors))
     return value
 
 

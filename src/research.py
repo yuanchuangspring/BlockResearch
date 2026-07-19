@@ -2,11 +2,12 @@
 from .director import build_stage
 from .executor import execute_stage, normalize_graph
 from .notebook import ResearchNotebook
+from .recorder import snapshot, start_run
 
 
 def _result(answer, stages, trace, outputs, notebook, error=""):
     return {"answer": answer, "stages": stages, "trace": trace, "outputs": outputs,
-            "research_state": notebook.to_dict(), "error": error}
+            "research_state": notebook.to_dict(), "event_log": snapshot(), "error": error}
 
 
 def _candidate(value):
@@ -33,6 +34,7 @@ def _stage_stats(outputs, nodes):
 
 
 async def research(question: str, max_stages: int = 8) -> dict:
+    start_run()
     notebook, trace, all_outputs, fallback = ResearchNotebook(), [], {}, ""
     for stage in range(1, max_stages + 1):
         try:

@@ -4,6 +4,7 @@ from openai import APIConnectionError, APITimeoutError
 
 from .context import json_text
 from .llm import ask_json
+from .runtime import env
 
 
 RECALL_PROMPT = """You are the retrieval planner for a deep-research agent. Maximize recall of named answer candidates and named intermediate entities without treating either as evidence.
@@ -34,12 +35,12 @@ async def _plan_json(prompt, user, model, tokens):
             action = "retrying GPT" if attempt < 3 else "switching to deepseek-v4-pro"
             print(f"[RETRIEVAL RETRY] attempt {attempt}/3 failed: {type(exc).__name__}; {action}", flush=True)
             if attempt < 3: await asyncio.sleep(attempt)
-    return await ask_json(prompt, user, os.environ.get("FALLBACK_SOLVER_MODEL", "deepseek-v4-pro"), tokens)
+    return await ask_json(prompt, user, env("FALLBACK_SOLVER_MODEL", "deepseek-v4-pro"), tokens)
 
 
 async def plan_retrieval(question, model=None):
     value = await _plan_json(RECALL_PROMPT, question,
-                             model or os.environ.get("SOLVER_MODEL", "gpt-5.5"), 1536)
+                             model or env("SOLVER_MODEL", "gpt-5.5"), 1536)
     routes = [item for item in value.get("routes", []) if isinstance(item, dict)][:6]
     return {"candidates": _strings(value.get("candidates"), 10),
             "bridges": _strings(value.get("bridges"), 10),
@@ -75,7 +76,7 @@ def _compact_cards(results, per_query=3):
 async def refine_retrieval(question, results, model=None):
     user = f"QUESTION:\n{question}\n\nBRAVE RESULTS GROUPED BY ROUTE:\n{json_text(_compact_cards(results), 30000)}"
     value = await _plan_json(REFINE_PROMPT, user,
-                             model or os.environ.get("SOLVER_MODEL", "gpt-5.5"), 1536)
+                             model or env("SOLVER_MODEL", "gpt-5.5"), 1536)
     pivots = [item for item in value.get("pivots", []) if isinstance(item, dict)
               and str(item.get("entity", "")).strip()][:8]
     return {"candidates": _strings(value.get("candidates"), 10),

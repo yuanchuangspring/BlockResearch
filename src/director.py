@@ -4,13 +4,16 @@ from openai import APIConnectionError, APITimeoutError
 
 from .context import compact_source, json_text
 from .llm import ask_json
+from .recorder import record
+from .runtime import env
 
 
 BUILDER_PROMPT = """You are the Builder of a deep-research system. At every stage, build a NEW executable DAG from the current research state.
 
 Your job is orchestration, not answering the domain question. Any professional inference must be delegated to a SOLVE node.
-Each graph must target one decisive uncertainty. Select 1-2 unresolved condition IDs in focus_condition_ids, state what observation would resolve them, and build only the smallest graph capable of obtaining that observation. A stage is successful only if it changes candidate coverage or verifies/contradicts a focused condition.
+Each graph may allocate work across a portfolio of competing research branches. During exploration, consider both advancing the current leader and challenging it or discovering alternatives; choose the graph shape by expected information gain rather than a fixed branch count. A stage succeeds only when it changes candidate coverage, retrieves a concrete new node, or verifies/contradicts a focused condition.
 You are also responsible for stopping. `max_stages` is a safety ceiling, not a target. Return decision:"answer" as soon as the best candidate is sufficiently supported, or when another stage has low expected information gain. If stop_guidance.stable_best_guess is non-empty, answer unless a live alternative has concrete evidence likely to overtake it. Unresolved details that only change confidence, not candidate ranking, are not a reason to continue. Use decision:"continue" only when one concrete next observation could realistically change the ranking.
+You have full authority to answer directly. When you know the answer, return `{"decision":"answer","best_guess":"the exact requested value","blocks":[]}`. Do not invent a domain-specific key such as song/company/person, and do not build ceremonial nodes merely to satisfy graph shape.
 Read candidate_memory and recent_builder_decisions. Preserve every serious candidate until evidence contradicts it; do not let a newly retrieved candidate erase an earlier one. Explain ranking changes in rationale.
 
 The RESEARCH STATE includes a `last_stage` summary (null on stage 1). Use it to choose the graph's strategic mode:
@@ -35,14 +38,17 @@ If last_stage.consecutive_zero_stages >= 2, the current approach is failing — 
 Read action_ledger before planning. Never repeat a query or refetch/reread a URL whose prior action had zero information_gain. Do not retrieve an already successful source unless a new search term targets a different focused condition.
 
 Graph contract:
-- Return 2-6 blocks. Use unique short ids and valid depends_on edges.
+- Return 2-8 blocks. Use unique short ids and valid depends_on edges.
+- Retrieval blocks may use params.branch_id to preserve branch ownership. Reuse a stable id from research_portfolio or create `discover:<short route>` for a new route.
+- Allocate one or more branches according to expected information gain. Challenge the leader when an alternative route can realistically change the ranking; do not create ceremonial branches or repeat weak searches merely to appear parallel.
+- When branches are compared, keep their observations independent until an explicit comparison SOLVE that depends on every branch it compares.
 - SOLVE and VERIFY are optional advisers. Use neither for mechanical retrieval; use them only when their judgment can change the Builder's next decision or terminate the research.
 - Available nodes:
-  SEARCH {queries:[...], queries_from_dependencies:false, n:5} (SERP only; use before selecting uncertain URLs)
-  BROWSE {queries:[...], queries_from_dependencies:false, n:5, fetch_per_query:1, search_terms:"..."}
-  FETCH {url:"https://...", search:"..."} (only for a URL already present in state)
-  FETCH {urls_from_dependencies:true, auto_select:true, max_urls:3, search:"..."} (deterministically fetches ranked, non-noise, domain-diverse ancestor SEARCH results)
-  READ_PDF {url:"https://...", search:"..."}
+  SEARCH {branch_id:"...", queries:[...], queries_from_dependencies:false, n:5} (SERP only; use before selecting uncertain URLs)
+  BROWSE {branch_id:"...", queries:[...], queries_from_dependencies:false, n:5, fetch_per_query:1, search_terms:"..."}
+  FETCH {branch_id:"...", url:"https://...", search:"..."} (only for a URL already present in state)
+  FETCH {branch_id:"...", urls_from_dependencies:true, auto_select:true, max_urls:5, search:"..."} (deterministically fetches rank-stratified, non-noise, domain-diverse ancestor SEARCH results)
+  READ_PDF {branch_id:"...", url:"https://...", search:"..."}
   CALCULATE {expression:"..."}
   PYTHON {code:"..."}
   SOLVE {role:"relevant expert", task:"precise inference task"} (optional adviser for genuinely difficult domain reasoning)
@@ -65,6 +71,8 @@ Graph contract:
 - Choose an indexed event, quote, title, or relationship as the discovery anchor. For location puzzles, announcements, ownership records and named events discover the place; map distance/radius clues only verify named places. Never begin by searching a bundle of proximity constraints.
 - Use a retrieval ladder: rare exact phrase -> relaxed lexical variants -> candidate-plus-unresolved-condition joins.
 - Discovery queries should normally contain one rare phrase or at most two relations. Long bags of clues attract SEO/query-echo pages and are not evidence of a match.
+- You are the final author of every SEARCH query: the executor sends it unchanged except whitespace normalization and deduplication. Write it with search-engine retrieval in mind. Infer the likely page genre and how its author would naturally phrase the fact; combine that source voice with a useful time anchor and a domain noun when they distinguish the page. Preserve rare names, dates, numbers and relation direction. Do not quote benchmark paraphrases as if they were verbatim source text unless the question explicitly gives a quotation.
+- Build a small query portfolio with genuinely different retrieval roles: a source-voice/page-genre route, a rare-relation route, a relaxed lexical route, and—when useful—an independent graph edge. Each query should retrieve one node or edge. After SERP results exist, stop paraphrasing the original clue and pivot from concrete titles, authors, organizations, documents or events found in those results.
 - Choose the search direction with the smallest plausible answer set. When the question joins a broad topic/work to rare biographical facts, first reverse-search the rare person signature, then verify that person's relation to the topic/work. Do not spend successive stages enumerating the broad side of the join.
 - Preserve relation semantics. Do not replace "a character develops feelings for their boss" with an assumed genre such as "boss romance"; search paraphrases, resolve the work/character relation, then map the work to its creator.
 - In stage 1, search several independent pairs of the rarest relations; do not append generic words from every condition into one long query.
@@ -87,12 +95,66 @@ Return:
 {"decision":"continue|answer","objective":"...","rationale":"why ranking changed or why stopping","focus_condition_ids":["k1"],"expected_observation":"...","best_guess":"current answer guess or empty","conditions":[],"blocks":[{"id":"...","type":"...","params":{},"depends_on":[]}]}
 The atomic conditions are already supplied in RESEARCH STATE. Do not decompose the question again and do not rewrite the conditions."""
 
+# Runtime prompt: keep the Builder centered on executable information flow.
+# The longer legacy prompt above remains temporarily for diff/audit history.
+GRAPH_BUILDER_PROMPT = """You are the Builder, the research lead and execution-graph architect of BlockResearch.
+
+CORE MISSION
+At every stage, read the complete RESEARCH STATE and build a NEW executable DAG that produces the most valuable next information. Your primary work is graph design: choose branches, tools, dependencies, joins, and stopping. SEARCH query writing is only one small parameter-level duty inside that graph.
+
+RESEARCH STYLE
+- Preserve the project's soul: research while building. The graph may be shallow or deep, narrow or broad, according to the problem and current evidence.
+- You may run independent branches in parallel, traverse intermediate entities across multiple hops, join observations, test contradictions, calculate derived conditions, or inspect primary sources.
+- Do not lock onto the first candidate. Keep serious alternatives alive until evidence changes their ranking, but do not create ceremonial branches with no expected information gain.
+- You orchestrate; professional interpretation belongs in an optional SOLVE node. VERIFY is an optional judge when acceptance could end the task.
+
+INFORMATION FLOW
+- Design dependencies deliberately. Every downstream node receives the complete raw outputs of all ancestors.
+- A retrieval result is useful only if it reaches the component that must act on it. If this stage needs names extracted, pages interpreted, branches compared, or an answer revised, connect the relevant SEARCH/FETCH outputs to a SOLVE join.
+- Never decide an answer before executing blocks whose observations could change that answer. `decision:"answer"` means the answer is already known from current state and therefore `blocks` must be empty.
+- When continuing, return `decision:"continue"`; newly executed observations will inform the next Builder stage or a dependent node in the current graph.
+- Search snippets are provisional navigation leads. Fetched text and valid derived inferences support evidence. Preserve useful intermediate entities even when they are not answer candidates.
+
+PLANNING
+1. Identify what changed in state and which uncertainty currently controls candidate ranking.
+2. Decide the smallest useful set of observations, including independent alternatives when they can realistically change the result.
+3. Build the complete DAG that obtains and consumes those observations.
+4. State the expected observation and why this graph has information gain over prior actions.
+5. Stop when the current state already supports a best answer or further work cannot change ranking.
+
+SEARCH QUERY DESIGN
+Write 2-4 precise, genuinely complementary queries for each SEARCH node. Each query should retrieve one concrete node or relation. Preserve discriminating dates, names, domains, and relation direction; infer the likely source type and its natural wording. Do not make every query depend on the same quoted phrase, repeat prior zero-gain queries, use placeholders, or stuff the whole question into one query. Once concrete entities appear, pivot subsequent searches from those exact entities.
+
+AVAILABLE NODES
+- SEARCH {branch_id:"optional", queries:["2-4 precise queries"], queries_from_dependencies:false, n:10}
+- BROWSE {branch_id:"optional", queries:["2-4 precise queries"], queries_from_dependencies:false, n:5, fetch_per_query:1, search_terms:"..."}
+- FETCH {branch_id:"optional", url:"https://...", search:"..."}
+- FETCH {branch_id:"optional", urls_from_dependencies:true, auto_select:true, max_urls:5, search:"..."}
+- READ_PDF {branch_id:"optional", url:"https://...", search:"..."}
+- CALCULATE {expression:"..."}
+- PYTHON {code:"..."}
+- SOLVE {role:"relevant expert", task:"precise task"}
+- VERIFY {candidate:"...", candidate_from_dependencies:false}
+
+GRAPH CONTRACT
+- Return 0-8 blocks with unique ids and valid depends_on edges.
+- Never invent URLs, observations, facts, candidates, or textual data plumbing.
+- Read failed_or_completed_actions; do not repeat zero-gain retrieval unchanged.
+- Use only condition ids already present in RESEARCH STATE.
+- A direct answer must use exactly `{"decision":"answer","best_guess":"exact requested value","blocks":[]}`.
+- Otherwise use decision:"continue" and provide an executable nonempty graph.
+
+Return only:
+{"decision":"continue|answer","objective":"...","rationale":"...","focus_condition_ids":["k1"],"expected_observation":"...","best_guess":"current guess or empty","conditions":[],"blocks":[{"id":"...","type":"...","params":{},"depends_on":[]}]}
+"""
+
 CONDITION_PROMPT = """You are the Question Modeler. Decompose the research question into atomic verification conditions; do not research, plan searches, name candidates, infer the answer, or build an execution graph.
 Each condition must be ONE independently verifiable subject–relation–object or numeric predicate. Split every conjunction, semicolon, chronology chain, range test, and multi-part event. For example, "an employee sued, the court certified the class, and settlement was $X" becomes three conditions. Include the exact requested answer attribute as the final condition. Preserve quantifiers and relation direction. Return at most 16 conditions.
 Return {"conditions":[{"id":"k1","description":"..."}]}."""
 
 SOLVER_PROMPT = """You are a professional research adviser reporting to the Builder. Analyze only the focused task and supplied stage material. Do not orchestrate the research program or design another execution graph.
 Preserve verified facts; never overturn them without explicit contradictory evidence.
+Candidate coverage is mandatory: scan every supplied result card and page before ranking. Include every concrete answer-type entity that matches at least one discriminating relation as a plausible candidate, even when it is only a search lead. Mark it plausible and explain the lead; do not omit it merely because it is not yet verified. This is candidate recall, not evidence promotion.
 First extract useful atomic direct claims from fetched pages. Every claim must include a short near-verbatim quote, the exact source_id/block id or page URL present in the dependency observations, mentioned entities, and relevant condition_ids. The program will reject claims whose quote is absent from that source. Search snippets are leads and cannot become claims.
 Then give the Builder a concise memo: what changed, ranked concrete candidates, the single decisive gap, and the best current guess. Always provide best_guess when any plausible candidate exists, even when evidence is incomplete.
 If and only if YOUR TASK asks for retrieval strategy or query formulation, include 4-8 concise diverse web queries in queries. These are advice for a dependent SEARCH node, not an execution graph. Otherwise return an empty queries list.
@@ -116,7 +178,7 @@ Return {"accepted":false,"reason":"state which conditions are unverified and why
 
 
 def _model(role, default=None):
-    return os.environ.get(f"{role}_MODEL") or default or os.environ.get("OPENAI_MODEL")
+    return env(f"{role}_MODEL") or default or env("OPENAI_MODEL")
 
 
 def _stage_one_language_ok(question, plan):
@@ -125,52 +187,107 @@ def _stage_one_language_ok(question, plan):
         return True
     queries = []
     for block in plan.get("blocks", []):
-        if str(block.get("type", "")).upper() != "BROWSE": continue
+        if str(block.get("type", "")).upper() not in {"SEARCH", "BROWSE"}: continue
         value = block.get("params", {}).get("queries", block.get("params", {}).get("query", []))
         queries += value if isinstance(value, list) else [value]
     foreign = sum(bool(re.search(r"[\u4e00-\u9fff]", str(query))) for query in queries)
     return not queries or foreign <= max(1, len(queries) // 4)
 
 
+def _retrieval_inputs_ok(plan):
+    """Reject retrieval nodes that cannot produce a query at runtime."""
+    for block in plan.get("blocks", []):
+        if not isinstance(block, dict) or str(block.get("type", "")).upper() not in {"SEARCH", "BROWSE"}:
+            continue
+        params = block.get("params") or {}
+        raw = params.get("queries", params.get("query", []))
+        queries = raw if isinstance(raw, list) else [raw]
+        has_query = any(str(query).strip() for query in queries)
+        if not has_query and not params.get("queries_from_dependencies"):
+            return False
+        if params.get("queries_from_dependencies") and not block.get("depends_on") and not has_query:
+            return False
+    return True
+
+
+async def _model_question(question):
+    """Question modeling is a required role, so transient/empty output is retryable."""
+    last_error = None
+    for attempt in range(1, 4):
+        try:
+            modeled = await ask_json(CONDITION_PROMPT, f"QUESTION:\n{question}",
+                                     _model("DIRECTOR"), 3072)
+            if isinstance(modeled.get("conditions"), list) and modeled["conditions"]:
+                record("role_result", role="question_modeler", attempt=attempt,
+                       input={"question": question}, output=modeled)
+                return modeled
+            raise ValueError("Question Modeler returned no atomic conditions")
+        except Exception as exc:
+            last_error = exc
+            record("role_error", role="question_modeler", attempt=attempt,
+                   input={"question": question}, error=f"{type(exc).__name__}: {exc}")
+            if attempt < 3:
+                print(f"[QUESTION MODELER RETRY] attempt {attempt}/3 failed: "
+                      f"{type(exc).__name__}; retrying", flush=True)
+                await asyncio.sleep(attempt)
+    raise last_error
+
+
 async def build_stage(question, notebook, stage, max_stages):
     if not notebook.conditions:
-        modeled = await ask_json(CONDITION_PROMPT, f"QUESTION:\n{question}", _model("DIRECTOR"), 3072)
+        modeled = await _model_question(question)
         notebook.set_conditions(modeled.get("conditions"))
-        if not notebook.conditions:
-            raise ValueError("Question Modeler returned no atomic conditions")
     state = notebook.prompt()
     user = f"QUESTION:\n{question}\n\nRESEARCH STATE:\n{state}\n\nSTAGE: {stage}/{max_stages}"
     issues = []
-    for attempt in range(2):
+    for attempt in range(1, 4):
         try:
-            plan = await ask_json(BUILDER_PROMPT, user, _model("DIRECTOR"), 4096)
+            plan = await ask_json(GRAPH_BUILDER_PROMPT, user, _model("DIRECTOR"), 4096)
+            record("role_result", role="builder", stage=stage,
+                   input={"question": question, "research_state": state,
+                          "stage": stage, "max_stages": max_stages}, output=plan)
         except Exception as exc:
             issues = [f"model_error:{type(exc).__name__}"]
+            print(f"[BUILDER RETRY] attempt {attempt}/3 failed: {issues[0]}; retrying", flush=True)
             user += f"\n\nThe previous build call failed ({issues[0]}). Return only the compact valid graph JSON now."
             continue
         language_ok = _stage_one_language_ok(question, plan)
         answering = plan.get("decision") == "answer" and bool(str(plan.get("best_guess", "")).strip())
-        blocks_ok = isinstance(plan.get("blocks"), list) and (bool(plan["blocks"]) or answering)
-        issues = [name for name, ok in (("blocks", blocks_ok), ("language", language_ok)) if not ok]
+        blocks = plan.get("blocks")
+        blocks_ok = isinstance(blocks, list) and (bool(blocks) or answering)
+        answer_shape_ok = plan.get("decision") != "answer" or (answering and blocks == [])
+        retrieval_ok = _retrieval_inputs_ok(plan)
+        issues = [name for name, ok in (("blocks", blocks_ok), ("answer_shape", answer_shape_ok),
+                                        ("retrieval_queries", retrieval_ok),
+                                        ("language", language_ok)) if not ok]
         if not issues:
             return plan
-        user += f"\n\nYour previous output violated: {', '.join(issues)}. Every stage must use the question language unless evidence establishes another locale. Rebuild it as a valid executable graph."
+        print(f"[BUILDER RETRY] attempt {attempt}/3 violated: {', '.join(issues)}; retrying", flush=True)
+        user += f"\n\nYour previous output violated: {', '.join(issues)}. Every stage must use the question language unless evidence establishes another locale. Rebuild a valid executable graph."
     raise ValueError(f"Builder returned no executable graph ({', '.join(issues)})")
 
 
 async def solve_node(question, task, role, notebook, observations):
-    bundle = {key: compact_source(value, 2500) for key, value in observations.items()}
+    bundle = {key: compact_source(value, 8000 if value.get("_type") == "SEARCH" else 3500)
+              for key, value in observations.items()}
     user = f"QUESTION:\n{question}\n\nYOUR ROLE: {role}\nYOUR TASK: {task}\n\nRESEARCH STATE:\n{notebook.solver_state()}\n\nDEPENDENCY OBSERVATIONS:\n{json_text(bundle, 26000)}"
     transient = (APIConnectionError, APITimeoutError, TimeoutError, ConnectionError)
     for attempt in range(1, 4):
         try:
-            return await ask_json(SOLVER_PROMPT, user, _model("SOLVER"), 4096)
+            result = await ask_json(SOLVER_PROMPT, user, _model("SOLVER"), 4096)
+            record("role_result", role="solver", input={"question": question, "role": role,
+                   "task": task, "research_state": notebook.solver_state(),
+                   "dependency_observations": bundle}, output=result)
+            return result
         except transient as exc:
             action = "retrying GPT" if attempt < 3 else "switching to deepseek-v4-pro"
             print(f"  [SOLVE RETRY] attempt {attempt}/3 failed: {type(exc).__name__}; {action}", flush=True)
             if attempt < 3:
                 await asyncio.sleep(attempt)
     report = await ask_json(SOLVER_PROMPT, user, _model("FALLBACK_SOLVER", "deepseek-v4-pro"), 4096)
+    record("role_result", role="solver_fallback", input={"question": question, "role": role,
+           "task": task, "research_state": notebook.solver_state(),
+           "dependency_observations": bundle}, output=report)
     report["degraded_model"] = True
     return report
 
@@ -192,4 +309,8 @@ async def verify_answer(question, candidate, claims, sources, conditions=None, h
         f"Only accept if EVERY condition is proven AND the identity chain is closed "
         f"(the candidate IS the entity the question asks about, not just someone with a matching attribute)."
     )
-    return await ask_json(VERIFIER_PROMPT, user, _model("VERIFIER"), 2048)
+    result = await ask_json(VERIFIER_PROMPT, user, _model("VERIFIER"), 2048)
+    record("role_result", role="verifier", input={"question": question, "candidate": candidate,
+           "claims": claims, "sources": sources, "conditions": conditions or [],
+           "hypotheses": hypotheses or [], "inferences": inferences or []}, output=result)
+    return result

@@ -80,8 +80,10 @@ def compact_source(value, text_limit=6000):
     if "links" in value:
         value["links"] = value["links"][:12]
     if "results" in value:
-        limit = 40 if value.get("_type") == "SEARCH" else 20
-        value["results"] = [{**item, "snippet": item.get("snippet", "")[:600]}
+        is_search = value.get("_type") == "SEARCH"
+        limit = 80 if is_search else 20
+        snippet_limit = 350 if is_search else 600
+        value["results"] = [{**item, "snippet": item.get("snippet", "")[:snippet_limit]}
                             for item in value["results"][:limit]]
     if isinstance(value.get("pages"), list):
         value["pages"] = [

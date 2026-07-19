@@ -6,8 +6,9 @@ from src import main
 import src.executor as executor
 import src.research as research_module
 import src.director as director_module
-from src.executor import _dependency_queries, _dependency_urls, normalize_graph
-from src.director import _stage_one_language_ok
+import src.tools as tools_module
+from src.executor import _dependency_queries, _dependency_urls, _rank_stratified, normalize_graph
+from src.director import _retrieval_inputs_ok, _stage_one_language_ok
 from src.research import _candidate
 from src.notebook import ResearchNotebook
 from src.tools import _docx_text, _expand_queries, _merge_results, _passage, calculate, run_python
@@ -15,6 +16,17 @@ from src.retrieval import _compact_cards
 
 
 class CoreTests(unittest.IsolatedAsyncioTestCase):
+    def test_portfolio_tracks_leader_and_verification_failures(self):
+        notebook = ResearchNotebook()
+        notebook.record_candidates(1, {"best_guess": "Ada", "candidates": [
+            {"name": "Ada", "status": "plausible", "why": "lead"},
+            {"name": "Grace", "status": "plausible", "why": "alternative"}]})
+        notebook.record_verification(1, "Ada", {"accepted": False, "reason": "missing edge"})
+        branches = notebook.research_portfolio()["live_branches"]
+        ada = next(item for item in branches if item["candidate"] == "Ada")
+        self.assertEqual(ada["verification_failures"], 1)
+        self.assertEqual(len(branches), 2)
+
     def test_answer_extraction(self):
         self.assertEqual(main.extract_answer("ANSWER: 109 — EURO 2016"), "109 — EURO 2016")
 
@@ -22,6 +34,19 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
         graph = normalize_graph({"blocks": [{"id": "q", "type": "BROWSE", "params": {"queries": ["x"]}}]}, 2)
         self.assertEqual(graph[0]["id"], "s2_q")
         self.assertEqual([item["type"] for item in graph], ["BROWSE"])
+
+    def test_builder_rejects_search_without_queries(self):
+        self.assertFalse(_retrieval_inputs_ok({"blocks": [
+            {"id": "q", "type": "SEARCH", "params": {"n": 10}}
+        ]}))
+        self.assertTrue(_retrieval_inputs_ok({"blocks": [
+            {"id": "q", "type": "SEARCH", "params": {"queries": ["Ada biography"]}}
+        ]}))
+        self.assertTrue(_retrieval_inputs_ok({"blocks": [
+            {"id": "solve", "type": "SOLVE", "params": {}},
+            {"id": "q", "type": "SEARCH", "params": {"queries_from_dependencies": True},
+             "depends_on": ["solve"]}
+        ]}))
 
     def test_builder_controls_where_solver_is_used(self):
         graph = normalize_graph({"blocks": [
@@ -40,7 +65,8 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
             {"conditions": [{"id": "k1", "description": "the employee filed suit"},
                             {"id": "k2", "description": "the court certified the class"}]},
             {"objective": "search", "conditions": [],
-             "blocks": [{"id": "solve", "type": "SOLVE", "params": {}, "depends_on": []}]},
+             "blocks": [{"id": "a", "type": "SEARCH", "params": {"branch_id": "discover:a", "queries": ["clue a"]}},
+                        {"id": "b", "type": "SEARCH", "params": {"branch_id": "discover:b", "queries": ["clue b"]}}]},
         ]
         async def fake_ask(*_args, **_kwargs): return outputs.pop(0)
         old = director_module.ask_json
@@ -53,6 +79,23 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([item["id"] for item in notebook.conditions], ["k1", "k2"])
         self.assertTrue(plan["blocks"])
 
+    async def test_question_modeler_retries_timeout_and_empty_conditions(self):
+        outputs = [TimeoutError("slow"), {"conditions": []},
+                   {"conditions": [{"id": "k1", "description": "answer"}]}]
+        async def fake_ask(*_args, **_kwargs):
+            value = outputs.pop(0)
+            if isinstance(value, Exception):
+                raise value
+            return value
+        old = director_module.ask_json
+        director_module.ask_json = fake_ask
+        try:
+            modeled = await director_module._model_question("Who?")
+        finally:
+            director_module.ask_json = old
+        self.assertEqual(modeled["conditions"][0]["id"], "k1")
+        self.assertFalse(outputs)
+
     async def test_builder_retries_model_json_failure(self):
         calls = 0
         async def fake_ask(*_args, **_kwargs):
@@ -62,7 +105,9 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
                 return {"conditions": [{"id": "k1", "description": "answer attribute"}]}
             if calls == 2:
                 raise ValueError("bad json")
-            return {"objective": "recover", "blocks": [{"id": "solve", "type": "SOLVE", "params": {}}]}
+            return {"objective": "recover", "blocks": [
+                {"id": "a", "type": "SEARCH", "params": {"branch_id": "discover:a", "queries": ["clue a"]}},
+                {"id": "b", "type": "SEARCH", "params": {"branch_id": "discover:b", "queries": ["clue b"]}}]}
         old = director_module.ask_json
         director_module.ask_json = fake_ask
         try:
@@ -71,6 +116,36 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
             director_module.ask_json = old
         self.assertEqual(calls, 3)
         self.assertEqual(plan["objective"], "recover")
+
+    async def test_builder_retries_empty_blocks(self):
+        outputs = [
+            {"conditions": [{"id": "k1", "description": "answer"}]},
+            {"objective": "empty", "blocks": []},
+            {"objective": "recover", "blocks": [{"id": "solve", "type": "SOLVE", "params": {}}]},
+        ]
+        async def fake_ask(*_args, **_kwargs): return outputs.pop(0)
+        old = director_module.ask_json
+        director_module.ask_json = fake_ask
+        try:
+            plan = await director_module.build_stage("Who?", ResearchNotebook(), 1, 8)
+        finally:
+            director_module.ask_json = old
+        self.assertEqual(plan["objective"], "recover")
+        self.assertFalse(outputs)
+
+    async def test_builder_rejects_noncontract_answer_then_accepts_standard_answer(self):
+        outputs = [{"conditions": [{"id": "k1", "description": "song"}]},
+                   {"song": "Porz Goret"},
+                   {"decision": "answer", "best_guess": "Porz Goret", "blocks": []}]
+        async def fake_ask(*_args, **_kwargs): return outputs.pop(0)
+        old = director_module.ask_json
+        director_module.ask_json = fake_ask
+        try:
+            plan = await director_module.build_stage("What song?", ResearchNotebook(), 1, 8)
+        finally:
+            director_module.ask_json = old
+        self.assertEqual(plan, {"decision": "answer", "best_guess": "Porz Goret", "blocks": []})
+        self.assertFalse(outputs)
 
     def test_no_match_sentinel_is_not_an_answer(self):
         self.assertEqual(_candidate("No match found"), "")
@@ -97,12 +172,21 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_dependency_urls(observations, auto_select=True),
                          ["https://a.example/one", "https://b.example/page"])
 
+    def test_auto_fetch_keeps_top_results_and_samples_deeper_candidates(self):
+        urls = [f"https://d{i}.example/page" for i in range(12)]
+        chosen = _rank_stratified(urls, 5)
+        self.assertEqual(chosen[:3], urls[:3])
+        self.assertIn(urls[-1], chosen)
+        self.assertEqual(len(chosen), 5)
+
     def test_query_batch_does_not_eagerly_double_every_quoted_query(self):
         self.assertEqual(_expand_queries(['"mascot" "named by Joanna"']), ['"mascot" "named by Joanna"'])
 
-    def test_query_compiler_splits_three_phrase_keyword_bag(self):
+    def test_query_compiler_never_deletes_builder_semantics(self):
         self.assertEqual(_expand_queries(['"former employee" "class action" "class certified" settlement']),
-                         ['"former employee" "class action"', '"class certified" settlement'])
+                         ['"former employee" "class action" "class certified" settlement'])
+        self.assertEqual(_expand_queries(['"song of the month" "album of the month" "2017" music']),
+                         ['"song of the month" "album of the month" "2017" music'])
 
     def test_query_echo_is_ranked_after_a_real_page(self):
         echo = {"title": "Query copy", "url": "https://x.test/rare-relation-person-place-year-event"}
@@ -295,6 +379,18 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("s1_page", seen)
         self.assertEqual(outputs["s1_solve"]["answer_candidate"], "Ada")
         self.assertEqual(notebook.claims[0]["level"], "verified")
+
+    async def test_search_many_promotes_total_backend_failure(self):
+        async def failed(_query, _n):
+            return {"error": "BRAVE_API_KEY is not configured", "results": []}
+        old = tools_module.search
+        tools_module.search = failed
+        try:
+            result = await tools_module.search_many(["one", "two"], 5)
+        finally:
+            tools_module.search = old
+        self.assertEqual(result["results"], [])
+        self.assertEqual(result["error"], "BRAVE_API_KEY is not configured")
 
     async def test_one_failed_solver_does_not_erase_parallel_branch(self):
         async def fake_solve(_q, task, _role, _notebook, observations):

@@ -4,6 +4,7 @@ import asyncio, re, time
 from .context import compact_source, useful
 from .director import solve_node, verify_answer
 from .tools import browse, search_many, calculate, fetch_page, read_pdf, run_python
+from .recorder import record
 
 TOOLS = {"SEARCH", "BROWSE", "FETCH", "READ_PDF", "CALCULATE", "PYTHON"}
 
@@ -11,7 +12,7 @@ TOOLS = {"SEARCH", "BROWSE", "FETCH", "READ_PDF", "CALCULATE", "PYTHON"}
 def normalize_graph(plan, stage):
     raw = plan.get("blocks") if isinstance(plan, dict) else []
     raw = raw if isinstance(raw, list) else []
-    raw = [block for block in raw if isinstance(block, dict)][:6]
+    raw = [block for block in raw if isinstance(block, dict)][:8]
     names, blocks = {}, []
     for i, block in enumerate(raw, 1):
         old = str(block.get("id") or f"b{i}")
@@ -51,11 +52,28 @@ def _dependency_urls(observations, auto_select=False):
         domain = re.sub(r"^www\.", "", re.sub(r"^https?://", "", url).split("/", 1)[0].lower())
         if domain and domain in domains: continue
         chosen.append(url); domains.add(domain)
-    return chosen[:6]
+    return chosen[:12]
+
+
+def _rank_stratified(urls, limit):
+    """Keep leading results while reserving slots for deeper candidate recall."""
+    urls = list(dict.fromkeys(urls))
+    if len(urls) <= limit:
+        return urls
+    head = urls[:min(3, limit)]
+    remaining = limit - len(head)
+    if remaining <= 0:
+        return head
+    tail = urls[len(head):]
+    positions = [round(i * (len(tail) - 1) / max(remaining - 1, 1)) for i in range(remaining)]
+    return head + [tail[i] for i in positions]
 
 
 async def _tool(block, observations=None):
     p, kind = block["params"], block["type"]
+    started = time.monotonic()
+    record("tool_request", block_id=block.get("id"), tool=kind, params=p,
+           dependency_observations=observations or {})
     try:
         if kind == "SEARCH":
             queries = p.get("queries", p.get("query", []))
@@ -75,15 +93,22 @@ async def _tool(block, observations=None):
             if not urls:
                 raw = p.get("urls", [p.get("url", "")])
                 urls = raw if isinstance(raw, list) else [raw]
-            urls = [url for url in urls if url][:min(max(int(p.get("max_urls", 3)), 1), 6)]
+            limit = min(max(int(p.get("max_urls", 5)), 1), 8)
+            urls = _rank_stratified([url for url in urls if url], limit) if p.get("auto_select") else [url for url in urls if url][:limit]
             pages = await asyncio.gather(*(fetch_page(url, p.get("search", "")) for url in urls))
             value = pages[0] if len(pages) == 1 else {"pages": pages, "urls": urls}
         elif kind == "READ_PDF": value = await read_pdf(p.get("url", ""), p.get("search", ""))
         elif kind == "CALCULATE": value = calculate(str(p.get("expression", "")))
         else: value = await run_python(str(p.get("code", "")))
-        return {"_type": kind, **value}
+        result = {"_type": kind, "_branch_id": str(p.get("branch_id", "")).strip(), **value}
+        record("tool_response", block_id=block.get("id"), tool=kind,
+               seconds=round(time.monotonic() - started, 3), output=result)
+        return result
     except Exception as exc:
-        return {"_type": kind, "error": f"{type(exc).__name__}: {exc}"}
+        result = {"_type": kind, "error": f"{type(exc).__name__}: {exc}"}
+        record("tool_response", block_id=block.get("id"), tool=kind,
+               seconds=round(time.monotonic() - started, 3), output=result)
+        return result
 
 
 def _ancestors(block, by_id, outputs):
@@ -98,6 +123,7 @@ def _ancestors(block, by_id, outputs):
 
 async def execute_stage(question, plan, notebook, stage, build_node=None):
     blocks = normalize_graph(plan, stage)
+    record("stage_graph", stage=stage, question=question, builder_output=plan, normalized_blocks=blocks)
     by_id, pending, outputs, trace, graph_ids = {b["id"]: b for b in blocks}, list(blocks), {}, [], {}
     while pending:
         ready = [b for b in pending if all(dep in outputs for dep in b["depends_on"])]
@@ -131,6 +157,8 @@ async def execute_stage(question, plan, notebook, stage, build_node=None):
         solve_nodes = [item for item in ready if item["type"] == "SOLVE"]
         for block in solve_nodes:
             print(f"  [SOLVE] {block['id']} ({block['params'].get('role', 'domain expert')})", flush=True)
+            record("block_status", stage=stage, block_id=block["id"], block_type="SOLVE",
+                   status="running", params=block["params"])
 
         async def run_solver(block):
             observations = _ancestors(block, by_id, outputs)
@@ -173,9 +201,14 @@ async def execute_stage(question, plan, notebook, stage, build_node=None):
             error = f" | {value['error'][:160]}" if value.get("error") else ""
             fallback = " | fallback=deepseek-v4-pro" if value.get("degraded_model") else ""
             print(f"  [SOLVE {mark}] {block['id']} | {value['seconds']:.0f}s{fallback}{error}", flush=True)
+            record("block_status", stage=stage, block_id=block["id"], block_type="SOLVE",
+                   status="error" if value.get("error") else "ok",
+                   seconds=value["seconds"], output=compact_source(value, 4000))
 
         verify_nodes = [item for item in ready if item["type"] == "VERIFY"]
         for block in verify_nodes:
+            record("block_status", stage=stage, block_id=block["id"], block_type="VERIFY",
+                   status="running", params=block["params"])
             observations = _ancestors(block, by_id, outputs)
             candidate = str(block["params"].get("candidate", "")).strip()
             placeholder = bool(re.search(r"\b(?:best|candidate|dependency|solver|above|previous)\b", candidate, re.I))
@@ -199,6 +232,9 @@ async def execute_stage(question, plan, notebook, stage, build_node=None):
             graph_ids[block["id"]] = notebook.add_node("VERIFY", {"stage": stage, **value}, deps)
             trace.append({**block, "output": value})
             print(f"  [VERIFY {'✓' if value.get('accepted') else '✗'}] {candidate} | {value['seconds']:.0f}s", flush=True)
+            record("block_status", stage=stage, block_id=block["id"], block_type="VERIFY",
+                   status="ok" if value.get("accepted") else "error",
+                   seconds=value["seconds"], output=value)
         done = {block["id"] for block in ready}
         pending = [block for block in pending if block["id"] not in done]
     return outputs, trace

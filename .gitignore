@@ -12,3 +12,14 @@ eval_traces/
 *.swo
 .claude/
 memory/
+HANDOFF.md
+PROGRESS.md
+intro.md
+analyze_traces.py
+eval_browsecomp.py
+eval_gaia.py
+eval_retrieval.py
+eval_sets.json
+课题要求.md
+README.md
+README_CN.md

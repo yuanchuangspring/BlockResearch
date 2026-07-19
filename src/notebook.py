@@ -143,14 +143,16 @@ class ResearchNotebook:
             if output.get("_type") not in {"SEARCH", "BROWSE"}:
                 continue
             self.sources[source] = {"type": "BROWSE", "urls": [item.get("url", "") for item in _items(output.get("results"))[:20]]}
-            for item in _items(output.get("results"))[:12]:
+            for item in _items(output.get("results"))[:60]:
                 title, snippet, url = _text(item.get("title")), _text(item.get("snippet")), str(item.get("url", ""))
                 claim = _text(f"{title} — {snippet}")
                 key = (url, claim.lower())
                 if not claim or key in known:
                     continue
                 record = {"id": self._claim_id(), "claim": claim, "quote": snippet,
-                          "source_id": source, "url": url, "query": _text(item.get("query")), "level": "lead"}
+                          "source_id": source, "url": url, "query": _text(item.get("query")),
+                          "rank": item.get("rank", item.get("backend_rank")),
+                          "branch_id": _text(output.get("_branch_id")), "level": "lead"}
                 self.leads.append(record)
                 known.add(key)
                 added.append(record["id"])
@@ -259,6 +261,7 @@ class ResearchNotebook:
             targets = targets if isinstance(targets, list) else [targets]
             self.action_ledger.append({
                 "stage": stage, "type": str(block.get("type", "")).upper(),
+                "branch_id": _text(params.get("branch_id")),
                 "targets": [_text(item) for item in targets if _text(item)][:8],
                 "focus": [_text(item) for item in (plan.get("focus_condition_ids") or []) if _text(item)],
                 "information_gain": information_gain,
@@ -283,7 +286,8 @@ class ResearchNotebook:
             name = _text(item.get("name"))
             if not name: continue
             key = name.lower()
-            old = self.candidate_memory.get(key, {"name": name})
+            old = self.candidate_memory.get(key, {"name": name, "first_seen_stage": stage,
+                                                   "best_count": 0, "verification_failures": 0})
             old.update({"status": _text(item.get("status")) or old.get("status", "plausible"),
                         "why": _text(item.get("why")) or old.get("why", ""),
                         "last_updated_stage": stage})
@@ -291,8 +295,11 @@ class ResearchNotebook:
         guess = _text(report.get("best_guess"))
         if guess:
             key = guess.lower()
-            self.candidate_memory.setdefault(key, {"name": guess, "status": "plausible", "why": ""})
+            self.candidate_memory.setdefault(key, {"name": guess, "status": "plausible", "why": "",
+                                                   "first_seen_stage": stage, "best_count": 0,
+                                                   "verification_failures": 0})
             self.candidate_memory[key]["last_best_stage"] = stage
+            self.candidate_memory[key]["best_count"] = self.candidate_memory[key].get("best_count", 0) + 1
         self.adviser_history.append({
             "stage": stage, "best_guess": guess,
             "decisive_gap": _text(report.get("decisive_gap")),
@@ -308,7 +315,35 @@ class ResearchNotebook:
         self.verification_history.append(record)
         self.verification_history = self.verification_history[-3:]
         if not record["accepted"] and record["reason"]:
+            key = record["candidate"].lower()
+            if key in self.candidate_memory:
+                self.candidate_memory[key]["verification_failures"] = self.candidate_memory[key].get("verification_failures", 0) + 1
             self.questions = (self.questions + [record["reason"]])[-12:]
+
+    def research_portfolio(self):
+        """Mechanical branch summary; compact control state, not another knowledge store."""
+        hypothesis = {_text(item.get("entity")).lower(): item for item in self.hypotheses}
+        rejected = {_text(item.get("candidate")).lower() for item in self.rejected_answers}
+        branches = []
+        for key, item in self.candidate_memory.items():
+            coverage = _items(hypothesis.get(key, {}).get("coverage"))
+            branches.append({
+                "branch_id": f"candidate:{key}", "candidate": item.get("name", key),
+                "status": "rejected" if key in rejected else item.get("status", "plausible"),
+                "verified_edges": sum(x.get("status") in {"verified", "derived"} for x in coverage if isinstance(x, dict)),
+                "contradicted_edges": sum(x.get("status") == "contradicted" for x in coverage if isinstance(x, dict)),
+                "best_count": item.get("best_count", 0),
+                "verification_failures": item.get("verification_failures", 0),
+                "last_updated_stage": item.get("last_updated_stage", item.get("last_best_stage", 0)),
+            })
+        branches.sort(key=lambda x: (x["status"] != "rejected", x["verified_edges"],
+                                      x["best_count"], -x["verification_failures"]), reverse=True)
+        live = [x for x in branches if x["status"] != "rejected" and not x["contradicted_edges"]]
+        return {
+            "live_branches": live[:6], "rejected_branches": [x for x in branches if x not in live][:4],
+            "allocation_guidance": ("compare advancing the leader against challenging it or opening an alternative; choose by expected information gain"
+                                    if live else "open independent discovery routes when they cover genuinely different graph edges"),
+        }
 
     def solver_state(self):
         """Compact proof state; raw retrieval observations are supplied separately."""
@@ -317,6 +352,7 @@ class ResearchNotebook:
             "verified_claims": self.claims[-20:],
             "candidate_condition_graph": self.hypotheses[-12:],
             "candidate_memory": list(self.candidate_memory.values())[-16:],
+            "research_portfolio": self.research_portfolio(),
             "decisive_gaps": self.questions[-6:],
             "rejected_answers": self.rejected_answers[-8:],
         }, ensure_ascii=False)
@@ -353,6 +389,7 @@ class ResearchNotebook:
             "derived_inferences": self.inferences[-16:], "candidate_leads": selected[-12:],
             "candidate_condition_graph": self.hypotheses[-12:], "decisive_gaps": self.questions[-6:],
             "candidate_memory": list(self.candidate_memory.values())[-16:],
+            "research_portfolio": self.research_portfolio(),
             "candidate_search_control": {
                 "verified_conditions_by_candidate": verified_by_candidate,
                 "proof_threshold_before_narrowing": proof_threshold,
