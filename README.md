@@ -4,10 +4,6 @@
 
 <em>Research While Building — Stage-wise dynamic graph construction for evidence-grounded deep research</em>
 
-[![GitHub Stars](https://img.shields.io/github/stars/yuanchuangspring/BlockResearch?style=flat-square)](https://github.com/yuanchuangspring/BlockResearch/stargazers)
-[![GitHub Forks](https://img.shields.io/github/forks/yuanchuangspring/BlockResearch?style=flat-square)](https://github.com/yuanchuangspring/BlockResearch/network)
-[![GitHub Issues](https://img.shields.io/github/issues/yuanchuangspring/BlockResearch?style=flat-square)](https://github.com/yuanchuangspring/BlockResearch/issues)
-
 [![Python](https://img.shields.io/badge/python-3.10+-blue?style=flat-square)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)](LICENSE)
 
