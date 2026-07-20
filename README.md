@@ -72,9 +72,3 @@ Open `http://localhost:8000` — type a question and watch execution graphs buil
 ```bash
 .venv/bin/python -m unittest discover -s tests -v
 ```
-
----
-
-## License
-
-MIT
