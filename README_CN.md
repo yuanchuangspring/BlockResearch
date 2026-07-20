@@ -5,7 +5,7 @@
 <em>边研究，边搭建 —— 逐阶段动态图构造，证据驱动的深度研究框架</em>
 
 [![Python](https://img.shields.io/badge/python-3.10+-blue?style=flat-square)](https://www.python.org/)
-[![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)](LICENSE)
+[![License](https://img.shields.io/github/license/yuanchuangspring/BlockResearch?style=flat-square)](LICENSE)
 
 [English](./README.md) | [中文文档](./README_CN.md)
 
