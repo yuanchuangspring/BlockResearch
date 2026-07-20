@@ -72,9 +72,3 @@ BRAVE_API_KEY=...
 ```bash
 .venv/bin/python -m unittest discover -s tests -v
 ```
-
----
-
-## License
-
-MIT
