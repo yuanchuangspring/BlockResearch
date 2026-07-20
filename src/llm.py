@@ -14,7 +14,12 @@ _new_client = None
 def _alternate(model: str) -> bool:
     """Route non-DeepSeek model families through the optional second endpoint."""
     return bool(env("NEW_API_KEY") and env("NEW_BASE_URL")
-                and model.startswith(("gpt-", "claude-", "gemini-")))
+                and (model == env("NEW_MODEL")
+                     or model.startswith(("gpt-", "claude-", "gemini-"))))
+
+def _streaming(model: str) -> bool:
+    return _alternate(model) or (str(model).startswith("deepseek")
+                                 and env("DEEPSEEK_STREAM", "1").lower() not in {"0", "false", "no"})
 
 def _get(model: str):
     global _client, _new_client
@@ -74,7 +79,25 @@ def _json_object(text: str):
                 pass
     return None
 
-async def ask(system: str, user: str, model=None, max_tokens=8192, retries=2) -> tuple[str, str]:
+
+async def _consume_stream(request):
+    """Collect an OpenAI-compatible stream while keeping long proxy connections alive."""
+    stream = await request
+    content, reasoning, finish = [], [], "unknown"
+    async for part in stream:
+        if not part.choices:
+            continue
+        choice = part.choices[0]
+        delta = choice.delta
+        if getattr(delta, "content", None):
+            content.append(delta.content)
+        if getattr(delta, "reasoning_content", None):
+            reasoning.append(delta.reasoning_content)
+        if choice.finish_reason:
+            finish = choice.finish_reason
+    return "".join(content), "".join(reasoning), finish
+
+async def ask(system: str, user: str, model=None, max_tokens=8192, retries=1) -> tuple[str, str]:
     """返回 (thinking, answer)。"""
     model = model or env("OPENAI_MODEL", "deepseek-v4-flash")
     last_err, budget = None, max_tokens
@@ -88,16 +111,21 @@ async def ask(system: str, user: str, model=None, max_tokens=8192, retries=2) ->
             }
             if _alternate(model):
                 params["reasoning_effort"] = env("REASONING_EFFORT", "low")
+            if _streaming(model):
+                params["stream"] = True
             record("llm_request", model=model, attempt=attempt + 1, system=system, user=user,
                    max_tokens=budget, reasoning_effort=params.get("reasoning_effort"))
             request = _get(model).chat.completions.create(**params)
-            resp = await (asyncio.wait_for(request, float(env("LLM_HARD_TIMEOUT", 120)))
-                          if _alternate(model) else request)
-            choice = resp.choices[0]
-            msg = choice.message
-            content = msg.content or ""
-            reasoning = getattr(msg, "reasoning_content", None) or ""
-            finish = choice.finish_reason or "unknown"
+            if _streaming(model):
+                content, reasoning, finish = await asyncio.wait_for(
+                    _consume_stream(request), float(env("LLM_HARD_TIMEOUT", 120)))
+            else:
+                resp = await request
+                choice = resp.choices[0]
+                msg = choice.message
+                content = msg.content or ""
+                reasoning = getattr(msg, "reasoning_content", None) or ""
+                finish = choice.finish_reason or "unknown"
             if content:
                 embedded, answer = _parse_think_answer(content)
                 if answer:
@@ -107,6 +135,10 @@ async def ask(system: str, user: str, model=None, max_tokens=8192, retries=2) ->
                            finish_reason=finish, raw_content=content, reasoning=thinking, answer=answer)
                     return thinking, answer
             last_err = RuntimeError(f"model produced no final answer (finish_reason={finish})")
+            record("llm_response_invalid", model=model, attempt=attempt + 1,
+                   seconds=round(asyncio.get_running_loop().time() - started, 3),
+                   finish_reason=finish, raw_content=content, reasoning=reasoning,
+                   error=str(last_err))
             if finish == "length":
                 budget = min(max(budget * 2, 1024), 32768)
             raise last_err
@@ -128,10 +160,10 @@ async def ask(system: str, user: str, model=None, max_tokens=8192, retries=2) ->
                 await asyncio.sleep(1 + attempt)
     raise last_err
 
-async def ask_json(system: str, user: str, model=None, max_tokens=4096) -> dict:
+async def ask_json(system: str, user: str, model=None, max_tokens=4096, attempts=2) -> dict:
     """Return a JSON object; retry malformed output instead of hiding it as {}."""
     suffix = "请只在 <answer> 标签中输出一个 JSON 对象。"
-    for attempt in range(2):
+    for attempt in range(attempts):
         instruction = suffix if not attempt else suffix + " 上次格式无效；不要输出解释或 Markdown。"
         _, answer = await ask(system, f"{user}\n\n{instruction}", model, max_tokens)
         value = _json_object(answer)

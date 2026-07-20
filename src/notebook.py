@@ -22,6 +22,7 @@ class ResearchNotebook:
         self.stage_summaries, self.action_ledger, self.builder_history = [], [], []
         self.candidate_memory = {}
         self.adviser_history, self.verification_history = [], []
+        self.passages = []
 
     def add_node(self, kind, payload, depends_on=()):
         node_id = f"n{len(self.graph) + 1}"
@@ -89,6 +90,43 @@ class ResearchNotebook:
                     return block_id, {"_type": "FETCH", **document}
         return "", {}
 
+    @staticmethod
+    def _claim_document(claim, output):
+        """Locate the concrete page inside a multi-page FETCH that contains a quote."""
+        quote = _text(claim.get("quote")).lower()
+        if not quote:
+            return None
+        tokens = set(re.findall(r"[a-z0-9]+", quote))
+        documents = _items(output.get("pages")) or [output]
+        for document in documents:
+            if not isinstance(document, dict):
+                continue
+            body = _text(document.get("text") or json.dumps(document, ensure_ascii=False, default=str)).lower()
+            overlap = len(tokens & set(re.findall(r"[a-z0-9]+", body))) / max(len(tokens), 1)
+            if quote in body or (len(tokens) >= 5 and overlap >= .8):
+                return document
+        return None
+
+    def _pin_claim_evidence(self, stage, source_block, document, claim):
+        """Keep claim-bearing text durable even after newer fetches fill the passage window."""
+        quote, text = _text(claim.get("quote")), _text(document.get("text"))
+        if not quote:
+            return
+        lower, needle = text.lower(), quote.lower()
+        pos = lower.find(needle)
+        excerpt = text[max(0, pos - 180):pos + len(quote) + 320] if pos >= 0 else quote
+        url = str(document.get("url", ""))
+        for passage in self.passages:
+            if passage.get("source_block_id") == source_block and passage.get("url") == url:
+                if quote.lower() in _text(passage.get("text")).lower():
+                    passage["pinned"] = True
+                    return
+        self.passages.append({
+            "id": f"p{len(self.passages) + 1}", "stage": stage,
+            "source_block_id": source_block, "url": url,
+            "text": excerpt[:700], "pinned": True,
+        })
+
     def integrate(self, audit, outputs, audit_node, allowed_sources=None):
         verified = {_text(item.get("claim")).lower() for item in self.claims}
         leads = {_text(item.get("claim")).lower(): item for item in self.leads}
@@ -101,9 +139,11 @@ class ResearchNotebook:
             source_block, output = self._resolve_source(source, outputs, allowed_sources)
             if not source_block:
                 continue
-            source_id = source if source != source_block else source_block
+            document = self._claim_document(item, output)
+            source_id = (source if source != source_block else "") or (
+                (str(document.get("url", "")) if document else "") or source_block)
             self.sources.setdefault(source_id, {"type": output.get("_type", "SOURCE"),
-                                                 "urls": [output.get("url", "")] if output.get("url") else []})
+                                                 "urls": [source_id] if source_id.startswith("http") else []})
             level = self._support_level(item, output)
             claim = _text(item.get("claim"))
             key = claim.lower()
@@ -130,6 +170,8 @@ class ResearchNotebook:
                 continue
             (self.claims if level == "verified" else self.leads).append(record)
             verified.add(key) if level == "verified" else leads.update({key: record})
+            if level == "verified" and document:
+                self._pin_claim_evidence(self.graph[-1].get("stage"), source_block, document, item)
             added.append(record["id"])
         if added:
             self.graph[-1]["claim_ids"] = added
@@ -157,6 +199,59 @@ class ResearchNotebook:
                 known.add(key)
                 added.append(record["id"])
         return added
+
+    @staticmethod
+    def _stratified_text(text, width=520, count=4):
+        """Small coverage-preserving excerpts; never keep only a document prefix."""
+        text = _text(text)
+        if len(text) <= width * count:
+            return [text] if text else []
+        starts = [round(i * (len(text) - width) / (count - 1)) for i in range(count)]
+        return [text[start:start + width] for start in starts]
+
+    def store_evidence(self, stage, outputs):
+        """Persist compact source excerpts even when a Solver fails to extract claims."""
+        known = {(item.get("source_block_id"), item.get("text")) for item in self.passages}
+        for block_id, output in outputs.items():
+            if not isinstance(output, dict) or output.get("error"):
+                continue
+            documents = output.get("pages") if isinstance(output.get("pages"), list) else [output]
+            for document in documents[:6]:
+                if not isinstance(document, dict) or document.get("error"):
+                    continue
+                excerpts = [_text(hit.get("text")) for hit in document.get("search_hits", [])[:3]
+                            if isinstance(hit, dict) and _text(hit.get("text"))]
+                if not excerpts:
+                    excerpts = self._stratified_text(document.get("text", ""))
+                if not excerpts and "data" in document:
+                    raw = json.dumps(document.get("data"), ensure_ascii=False, default=str)
+                    excerpts = self._stratified_text(raw)
+                for excerpt in excerpts[:4]:
+                    key = (block_id, excerpt)
+                    if not excerpt or key in known:
+                        continue
+                    self.passages.append({
+                        "id": f"p{len(self.passages) + 1}", "stage": stage,
+                        "source_block_id": block_id, "url": str(document.get("url", "")),
+                        "text": excerpt[:700],
+                    })
+                    known.add(key)
+        if len(self.passages) > 40:
+            pinned = [item for item in self.passages if item.get("pinned")][-20:]
+            recent = [item for item in self.passages if item not in pinned][-40 + len(pinned):]
+            self.passages = recent + pinned
+
+    def source_excerpts(self, source_ids, limit=12):
+        wanted = {str(item) for item in source_ids if item}
+        rows = [item for item in self.passages if item.get("source_block_id") in wanted]
+        return rows[-limit:]
+
+    def evidence_frontier(self, limit=6):
+        """Blend durable claim-bearing passages with recent exploratory evidence."""
+        pinned = [item for item in self.passages if item.get("pinned")]
+        selected = pinned[-max(1, limit // 2):]
+        selected += [item for item in reversed(self.passages) if item not in selected][:limit - len(selected)]
+        return list(reversed(selected))
 
     def record_plan(self, plan):
         analysis = _text(plan.get("reasoning") or plan.get("analysis"))
@@ -254,17 +349,22 @@ class ResearchNotebook:
     def record_actions(self, stage, plan, outputs, information_gain):
         """Remember attempted retrievals so the next Builder chooses a new action."""
         for block in (plan.get("blocks") or []):
-            if not isinstance(block, dict) or str(block.get("type", "")).upper() not in {"SEARCH", "BROWSE", "FETCH", "READ_PDF"}:
+            if not isinstance(block, dict) or str(block.get("type", "")).upper() not in {
+                    "SEARCH", "BROWSE", "FETCH", "READ_PDF", "PYTHON", "CALCULATE"}:
                 continue
             params = block.get("params") or {}
-            targets = params.get("queries", params.get("urls", params.get("url", [])))
+            targets = params.get("queries", params.get("urls", params.get("url", params.get("code", []))))
             targets = targets if isinstance(targets, list) else [targets]
+            suffix = re.sub(r"[^a-zA-Z0-9_]+", "_", _text(block.get("id")))
+            result = outputs.get(f"s{stage}_{suffix}", {})
             self.action_ledger.append({
                 "stage": stage, "type": str(block.get("type", "")).upper(),
                 "branch_id": _text(params.get("branch_id")),
                 "targets": [_text(item) for item in targets if _text(item)][:8],
                 "focus": [_text(item) for item in (plan.get("focus_condition_ids") or []) if _text(item)],
                 "information_gain": information_gain,
+                "outcome": "error" if result.get("error") else "ok",
+                "error": _text(result.get("error"))[:240],
             })
         self.action_ledger = self.action_ledger[-24:]
 
@@ -281,19 +381,35 @@ class ResearchNotebook:
         self.builder_history = self.builder_history[-4:]
 
     def record_candidates(self, stage, report):
+        reported_names = set()
+        verified_ids = {item.get("id") for item in self.claims}
         for item in _items(report.get("candidates")):
             if not isinstance(item, dict): continue
             name = _text(item.get("name"))
             if not name: continue
             key = name.lower()
+            reported_names.add(key)
             old = self.candidate_memory.get(key, {"name": name, "first_seen_stage": stage,
                                                    "best_count": 0, "verification_failures": 0})
-            old.update({"status": _text(item.get("status")) or old.get("status", "plausible"),
+            status = _text(item.get("status")) or old.get("status", "plausible")
+            contradiction_ids = [value for value in _items(item.get("contradiction_claim_ids"))
+                                 if value in verified_ids]
+            # Candidate ranking is advice, not evidence. A negative state transition
+            # requires an explicit verified contradiction; absence of proof or support
+            # for a competing candidate cannot erase an existing hypothesis.
+            if status == "contradicted" and not contradiction_ids:
+                status = old.get("status", "plausible")
+                if status == "contradicted":
+                    status = "plausible"
+            old.update({"status": status,
                         "why": _text(item.get("why")) or old.get("why", ""),
+                        "contradiction_claim_ids": contradiction_ids,
                         "last_updated_stage": stage})
+            item["status"] = status
             self.candidate_memory[key] = old
         guess = _text(report.get("best_guess"))
-        if guess:
+        # A list-valued answer is not itself another candidate entity.
+        if guess and (not reported_names or guess.lower() in reported_names):
             key = guess.lower()
             self.candidate_memory.setdefault(key, {"name": guess, "status": "plausible", "why": "",
                                                    "first_seen_stage": stage, "best_count": 0,
@@ -311,7 +427,10 @@ class ResearchNotebook:
     def record_verification(self, stage, candidate, verdict):
         record = {"stage": stage, "candidate": _text(candidate),
                   "accepted": bool(verdict.get("accepted")),
-                  "reason": _text(verdict.get("reason"))[:1000]}
+                  "reason": _text(verdict.get("reason"))[:1000],
+                  "supported_condition_ids": [_text(x) for x in _items(verdict.get("supported_condition_ids")) if _text(x)],
+                  "unsupported_condition_ids": [_text(x) for x in _items(verdict.get("unsupported_condition_ids")) if _text(x)],
+                  "contradicted_condition_ids": [_text(x) for x in _items(verdict.get("contradicted_condition_ids")) if _text(x)]}
         self.verification_history.append(record)
         self.verification_history = self.verification_history[-3:]
         if not record["accepted"] and record["reason"]:
@@ -345,16 +464,42 @@ class ResearchNotebook:
                                     if live else "open independent discovery routes when they cover genuinely different graph edges"),
         }
 
+    def candidate_ledger(self, limit=10):
+        """One authoritative candidate/condition view shared by every reasoning role."""
+        hypotheses = {_text(item.get("entity")).lower(): item for item in self.hypotheses}
+        rows = []
+        for key, item in self.candidate_memory.items():
+            coverage = []
+            for edge in _items(hypotheses.get(key, {}).get("coverage")):
+                if not isinstance(edge, dict):
+                    continue
+                coverage.append({"condition_id": edge.get("condition_id"),
+                                 "status": edge.get("status", "unknown"),
+                                 "evidence_ids": edge.get("evidence_ids", [])[:6]})
+            rows.append({
+                "name": item.get("name", key), "status": item.get("status", "plausible"),
+                "why": _text(item.get("why"))[:220], "coverage": coverage,
+                "best_count": item.get("best_count", 0),
+                "verification_failures": item.get("verification_failures", 0),
+            })
+        known = {row["name"].lower() for row in rows}
+        for key, item in hypotheses.items():
+            if key not in known:
+                rows.append({"name": item.get("entity", key), "status": "plausible", "why": "",
+                             "coverage": item.get("coverage", [])})
+        return rows[-limit:]
+
     def solver_state(self):
-        """Compact proof state; raw retrieval observations are supplied separately."""
+        """Only durable facts needed to interpret this node's observations."""
         return json.dumps({
             "conditions": self.conditions,
-            "verified_claims": self.claims[-20:],
-            "candidate_condition_graph": self.hypotheses[-12:],
-            "candidate_memory": list(self.candidate_memory.values())[-16:],
-            "research_portfolio": self.research_portfolio(),
-            "decisive_gaps": self.questions[-6:],
-            "rejected_answers": self.rejected_answers[-8:],
+            "verified_claims": [{key: item.get(key) for key in
+                                 ("id", "claim", "entities", "condition_ids", "source_id")}
+                                for item in self.claims[-8:]],
+            "candidate_ledger": self.candidate_ledger(8),
+            "decisive_gaps": [_text(item)[:300] for item in self.questions[-2:]],
+            "rejected_answers": self.rejected_answers[-6:],
+            "recent_evidence": self.evidence_frontier(4),
         }, ensure_ascii=False)
 
     def prompt(self):
@@ -370,7 +515,7 @@ class ResearchNotebook:
                 continue
             seen_queries.add(query)
             recent.append(item)
-            if len(recent) >= 12:
+            if len(recent) >= 8:
                 break
         selected += [item for item in reversed(recent) if item not in selected]
         last_stage = self.stage_summaries[-1] if self.stage_summaries else None
@@ -382,30 +527,55 @@ class ResearchNotebook:
         proof_threshold = max(2, (len(self.conditions) + 1) // 2)
         recent_guesses = [item.get("best_guess", "") for item in self.builder_history if item.get("best_guess")]
         stable_guess = recent_guesses[-1] if len(recent_guesses) >= 2 and recent_guesses[-1] == recent_guesses[-2] else ""
+        # Builder needs the durable decision frontier, not every parallel view
+        # maintained for trace/debug output.
+        claims = [{key: item.get(key) for key in
+                   ("id", "claim", "entities", "condition_ids", "source_id")}
+                  for item in self.claims[-10:]]
+        leads = [{"id": item.get("id"), "lead": _text(item.get("claim"))[:260],
+                  "url": str(item.get("url", ""))[:220], "query": _text(item.get("query"))[:160],
+                  "rank": item.get("rank"), "branch_id": item.get("branch_id", "")}
+                 for item in selected[-5:]]
+        previous = dict(self.builder_history[-1]) if self.builder_history else None
+        if previous:
+            previous["rationale"] = _text(previous.get("rationale"))[:350]
+            previous["expected_observation"] = _text(previous.get("expected_observation"))[:250]
+        adviser = dict(self.adviser_history[-1]) if self.adviser_history else None
+        if adviser:
+            adviser["memo"] = _text(adviser.get("memo"))[:350]
+            adviser["decisive_gap"] = _text(adviser.get("decisive_gap"))[:350]
+            adviser["recommendation"] = _text(adviser.get("recommendation"))[:350]
+        verifications = [{**item, "reason": _text(item.get("reason"))[:400]}
+                         for item in self.verification_history[-2:]]
+        actions = []
+        for item in self.action_ledger[-4:]:
+            actions.append({**item, "targets": [_text(x)[:180] for x in item.get("targets", [])[:4]]})
         return json.dumps({
             "source_policy": "search_leads are untrusted navigation hints, never facts; ignore query echoes, unrelated domains, and snippets without a concrete named entity",
             "candidate_policy": "hypotheses contain concrete named entities only; any candidate contradicting a required condition is pruned and must not drive confirmation search",
-            "conditions": self.conditions, "verified_claims": self.claims[-24:],
-            "derived_inferences": self.inferences[-16:], "candidate_leads": selected[-12:],
-            "candidate_condition_graph": self.hypotheses[-12:], "decisive_gaps": self.questions[-6:],
-            "candidate_memory": list(self.candidate_memory.values())[-16:],
-            "research_portfolio": self.research_portfolio(),
+            "conditions": self.conditions,
+            "verified_claims": claims,
+            "derived_inferences": self.inferences[-6:],
+            "candidate_leads": leads,
+            "evidence_frontier": self.evidence_frontier(6),
+            "decisive_gaps": [_text(item)[:350] for item in self.questions[-3:]],
+            "candidate_ledger": self.candidate_ledger(10),
             "candidate_search_control": {
                 "verified_conditions_by_candidate": verified_by_candidate,
                 "proof_threshold_before_narrowing": proof_threshold,
                 "exploration_required": max(verified_by_candidate.values(), default=0) < proof_threshold,
             },
-            "rejected_answers": self.rejected_answers,
+            "rejected_answers": self.rejected_answers[-6:],
             "last_stage": last_stage,
-            "recent_builder_decisions": self.builder_history,
-            "recent_adviser_reports": self.adviser_history,
-            "recent_verifications": self.verification_history,
+            "previous_builder_decision": previous,
+            "latest_adviser_report": adviser,
+            "recent_verifications": verifications,
             "stop_guidance": {
                 "stable_best_guess": stable_guess,
                 "rule": "answer when the same candidate leads for two decisions and no live alternative has evidence likely to overtake it; unresolved confidence-only details do not justify another stage",
             },
-            "failed_or_completed_actions": self.action_ledger[-12:],
-        }, ensure_ascii=False, indent=2)
+            "failed_or_completed_actions": actions,
+        }, ensure_ascii=False)
 
     def evidence_graph(self):
         nodes = ([{"id": x["id"], "type": "condition", "label": x["description"]} for x in self.conditions] +
@@ -441,6 +611,7 @@ class ResearchNotebook:
             "candidate_memory": list(self.candidate_memory.values()),
             "adviser_history": self.adviser_history,
             "verification_history": self.verification_history,
+            "evidence_passages": self.passages,
         }
 
     def proof(self, claim_ids, inference_ids):

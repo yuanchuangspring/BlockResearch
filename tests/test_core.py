@@ -8,10 +8,10 @@ import src.research as research_module
 import src.director as director_module
 import src.tools as tools_module
 from src.executor import _dependency_queries, _dependency_urls, _rank_stratified, normalize_graph
-from src.director import _retrieval_inputs_ok, _stage_one_language_ok
+from src.director import _retrieval_inputs_ok, _solver_bundle, _stage_one_language_ok
 from src.research import _candidate
 from src.notebook import ResearchNotebook
-from src.tools import _docx_text, _expand_queries, _merge_results, _passage, calculate, run_python
+from src.tools import _docx_text, _xlsx_text, _expand_queries, _merge_results, _passage, calculate, run_python
 from src.retrieval import _compact_cards
 
 
@@ -205,6 +205,15 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
             archive.writestr("word/document.xml", "<w:document><w:t>Tourist arrivals 5.4%</w:t></w:document>")
         self.assertIn("Tourist arrivals 5.4%", _docx_text(buffer.getvalue()))
 
+    def test_xlsx_is_extracted_as_rows(self):
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("xl/sharedStrings.xml",
+                             '<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><si><t>Country</t></si><si><t>Nigeria</t></si></sst>')
+            archive.writestr("xl/worksheets/sheet1.xml",
+                             '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row><c t="s"><v>0</v></c><c t="s"><v>1</v></c><c><v>0.560</v></c></row></sheetData></worksheet>')
+        self.assertIn("Country\tNigeria\t0.560", _xlsx_text(buffer.getvalue()))
+
     def test_snippet_is_lead_but_page_is_verified(self):
         notebook = ResearchNotebook()
         audit = {"claims": [{"claim": "Ada was born in 1815", "quote": "Ada was born in 1815", "source_id": "web"}]}
@@ -228,6 +237,26 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(notebook.claims), 1)
         self.assertEqual(notebook.claims[0]["source_id"], "https://example.com/article")
         self.assertEqual(notebook.claims[0]["source_block_id"], "s1_web")
+
+    def test_claim_from_multi_page_fetch_keeps_exact_page_and_passage(self):
+        notebook = ResearchNotebook()
+        notebook.add_node("SOLVE", {"stage": 1})
+        outputs = {"s1_fetch": {"_type": "FETCH", "pages": [
+            {"url": "https://primary.test/dream", "text": "Dream Blast hosts an Earth Day environment season."},
+            {"url": "https://other.test/story", "text": "Another game also joined Earth Day."},
+        ]}}
+        audit = {"claims": [{"claim": "Dream Blast has an Earth Day season",
+                              "quote": "Dream Blast hosts an Earth Day environment season",
+                              "source_id": "s1_fetch", "entities": ["Dream Blast"]}]}
+        notebook.integrate(audit, outputs, "n1", {"s1_fetch"})
+        self.assertEqual(notebook.claims[0]["source_id"], "https://primary.test/dream")
+        pinned = [item for item in notebook.passages if item.get("pinned")]
+        self.assertEqual(pinned[0]["url"], "https://primary.test/dream")
+        for i in range(50):
+            notebook.store_evidence(2, {f"s2_{i}": {"_type": "FETCH", "url": f"https://noise/{i}",
+                                                          "text": (f"noise {i} " * 100)}})
+        self.assertTrue(any(item.get("url") == "https://primary.test/dream"
+                            for item in notebook.evidence_frontier()))
 
     def test_auditor_numeric_condition_id_maps_to_canonical_id(self):
         notebook = ResearchNotebook()
@@ -256,7 +285,7 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
         ]}]})
         graph = notebook.evidence_graph()
         self.assertIn({"from": "entity:acme", "to": "k1", "type": "lead", "evidence_ids": ["c1"]}, graph["edges"])
-        self.assertIn("candidate_condition_graph", notebook.prompt())
+        self.assertIn("candidate_ledger", notebook.prompt())
 
     def test_builder_frontier_preserves_distinct_search_routes(self):
         notebook = ResearchNotebook()
@@ -357,6 +386,22 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([item["query"] for item in cards], ["route a", "route b"])
         self.assertEqual([len(item["results"]) for item in cards], [2, 2])
 
+    def test_solver_search_view_drops_token_heavy_transport_fields(self):
+        results = [{"title": f"Candidate {i}", "snippet": "clue " * 100,
+                    "url": f"https://example.com/very/long/path/{i}?tracking=large",
+                    "query": "rare relation", "rank": i, "backend": "brave",
+                    "query_echo": False} for i in range(20)]
+        bundle = _solver_bundle({"s1_q": {"_type": "SEARCH", "queries": ["rare relation"],
+                                                   "results": results}})
+        view = bundle["s1_q"]
+        self.assertEqual(len(view["results"]), 8)
+        self.assertEqual(view["result_count"], 20)
+        self.assertNotIn("url", view["results"][0])
+        self.assertNotIn("backend", view["results"][0])
+        self.assertNotIn("query", view["results"][0])
+        self.assertEqual(view["results"][0]["query_id"], 1)
+        self.assertEqual(view["results"][0]["domain"], "example.com")
+
     async def test_solver_receives_same_stage_dependency_output(self):
         seen = {}
         async def fake_tool(_block, _observations=None): return {"_type": "FETCH", "text": "The answer is Ada."}
@@ -411,6 +456,62 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("bad json", outputs["s1_bad"]["error"])
         self.assertEqual(outputs["s1_good"]["reasoning"], "ok")
         self.assertEqual(outputs["s1_join"]["reasoning"], "joined")
+
+    async def test_solver_retries_returned_but_unparseable_response(self):
+        calls = 0
+        async def fake_ask(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise ValueError("model returned no valid JSON object")
+            return {"memo": "recovered", "queries": [], "claims": [], "candidates": [],
+                    "decisive_gap": "", "recommendation": "", "best_guess": "Ada"}
+        async def no_sleep(*_args): pass
+        old_ask, old_sleep = director_module.ask_json, director_module.asyncio.sleep
+        director_module.ask_json, director_module.asyncio.sleep = fake_ask, no_sleep
+        try:
+            result = await director_module.solve_node("Who?", "answer", "expert",
+                                                      ResearchNotebook(), {})
+        finally:
+            director_module.ask_json, director_module.asyncio.sleep = old_ask, old_sleep
+        self.assertEqual(calls, 2)
+        self.assertEqual(result["best_guess"], "Ada")
+
+    async def test_deepseek_solver_has_reasoning_output_budget(self):
+        seen = {}
+        async def fake_ask(_system, _user, model, max_tokens, **_kwargs):
+            seen.update(model=model, max_tokens=max_tokens)
+            return {"memo": "ok", "claims": [], "candidates": [], "best_guess": ""}
+        old_ask, old_model = director_module.ask_json, director_module._model
+        director_module.ask_json = fake_ask
+        director_module._model = lambda role, default=None: "deepseek-v4-pro"
+        try:
+            await director_module.solve_node("Who?", "answer", "expert", ResearchNotebook(), {})
+        finally:
+            director_module.ask_json, director_module._model = old_ask, old_model
+        self.assertEqual(seen["max_tokens"], 8192)
+
+    async def test_solver_receives_direct_dependencies_not_redundant_ancestors(self):
+        seen = {}
+        async def fake_tool(block, _observations=None):
+            return ({"_type": "SEARCH", "results": [{"url": "https://x.test", "title": "x"}]}
+                    if block["type"] == "SEARCH" else
+                    {"_type": "FETCH", "url": "https://x.test", "text": "useful page"})
+        async def fake_solve(_q, _task, _role, _notebook, observations):
+            seen.update(observations)
+            return {"memo": "ok", "claims": [], "candidates": [], "best_guess": ""}
+        old_tool, old_solve = executor._tool, executor.solve_node
+        executor._tool, executor.solve_node = fake_tool, fake_solve
+        try:
+            await executor.execute_stage("Who?", {"blocks": [
+                {"id": "search", "type": "SEARCH", "params": {"queries": ["x"]}},
+                {"id": "fetch", "type": "FETCH", "params": {"url": "https://x.test"},
+                 "depends_on": ["search"]},
+                {"id": "solve", "type": "SOLVE", "params": {}, "depends_on": ["fetch"]},
+            ]}, ResearchNotebook(), 1)
+        finally:
+            executor._tool, executor.solve_node = old_tool, old_solve
+        self.assertEqual(set(seen), {"s1_fetch"})
 
     async def test_verifier_consumes_dependency_best_guess_not_placeholder(self):
         seen = {}
@@ -495,12 +596,28 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
             research_module.build_stage, research_module.execute_stage = old
         self.assertEqual(result["answer"], "ANSWER: Intermediate Anchor")
 
+    async def test_solver_cannot_silently_replace_builder_best_guess(self):
+        async def fake_build(_q, _n, stage, _max):
+            return {"objective": str(stage), "best_guess": "Builder Candidate",
+                    "blocks": [{"id": "solve", "type": "SOLVE", "params": {}}]}
+        async def fake_execute(_q, _p, _n, stage, _build):
+            return {f"s{stage}_solve": {"best_guess": "Unsupported Solver Guess"}}, []
+        old = research_module.build_stage, research_module.execute_stage
+        research_module.build_stage, research_module.execute_stage = fake_build, fake_execute
+        try:
+            result = await research_module.research("Who?", 1)
+        finally:
+            research_module.build_stage, research_module.execute_stage = old
+        self.assertEqual(result["answer"], "ANSWER: Builder Candidate")
+
     def test_calculate_is_restricted(self):
         self.assertEqual(calculate("ceil(1037 * 0.04)")["value"], 42)
         self.assertIn("error", calculate("__import__('os')"))
 
     async def test_python_is_restricted(self):
         self.assertEqual((await run_python("print(sum(range(5)))"))["stdout"].strip(), "10")
+        result = await run_python("print(DATA['rows'][1])", {"rows": [3, 7]})
+        self.assertEqual(result["stdout"].strip(), "7")
         self.assertIn("error", await run_python("import os"))
 
     def test_stage_summary_is_null_before_any_stage(self):
@@ -544,6 +661,15 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
         notebook.leads.append({"id": "c1", "claim": "SEO noise", "level": "lead", "source_id": "s"})
         self.assertNotIn("SEO noise", notebook.solver_state())
 
+    def test_unextracted_source_survives_as_cross_stage_evidence(self):
+        notebook = ResearchNotebook()
+        text = "A" * 1700 + "MIDDLE CANDIDATE" + "B" * 3300 + "TAIL FACT"
+        notebook.store_evidence(1, {"s1_fetch": {"_type": "FETCH", "url": "https://x.test", "text": text}})
+        state = notebook.prompt()
+        self.assertIn("evidence_frontier", state)
+        self.assertIn("MIDDLE CANDIDATE", state)
+        self.assertIn("TAIL FACT", state)
+
     def test_candidate_memory_preserves_ranked_adviser_candidates(self):
         notebook = ResearchNotebook()
         notebook.record_candidates(2, {"best_guess": "Ada", "candidates": [
@@ -552,8 +678,36 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
         ]})
         state = notebook.prompt()
         self.assertIn('"name": "Ada"', state)
-        self.assertIn('"last_best_stage": 2', state)
+        self.assertIn('"best_count": 1', state)
         self.assertIn('"name": "Grace"', state)
+
+    def test_candidate_cannot_be_contradicted_without_verified_claim(self):
+        notebook = ResearchNotebook()
+        notebook.record_candidates(1, {"candidates": [
+            {"name": "Ada", "status": "supported", "why": "direct source"}]})
+        notebook.record_candidates(2, {"candidates": [
+            {"name": "Ada", "status": "contradicted", "why": "Grace also matches"}]})
+        self.assertEqual(notebook.candidate_memory["ada"]["status"], "supported")
+
+    def test_candidate_contradiction_requires_verified_claim_id(self):
+        notebook = ResearchNotebook()
+        notebook.claims.append({"id": "c1", "claim": "Ada failed k1", "level": "verified"})
+        notebook.record_candidates(1, {"candidates": [{
+            "name": "Ada", "status": "contradicted", "why": "failed k1",
+            "contradiction_claim_ids": ["c1"]}]})
+        self.assertEqual(notebook.candidate_memory["ada"]["status"], "contradicted")
+        self.assertEqual(notebook.candidate_memory["ada"]["contradiction_claim_ids"], ["c1"])
+
+    def test_verification_preserves_partial_condition_result(self):
+        notebook = ResearchNotebook()
+        notebook.record_verification(2, "Ada and Grace", {
+            "accepted": False, "reason": "k2 is missing",
+            "supported_condition_ids": ["k1"], "unsupported_condition_ids": ["k2"],
+            "contradicted_condition_ids": []})
+        saved = notebook.verification_history[-1]
+        self.assertEqual(saved["supported_condition_ids"], ["k1"])
+        self.assertEqual(saved["unsupported_condition_ids"], ["k2"])
+        self.assertEqual(saved["contradicted_condition_ids"], [])
 
     async def test_builder_can_end_before_stage_limit_with_best_guess(self):
         async def fake_build(*_args):
@@ -566,6 +720,23 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
             research_module.build_stage = old
         self.assertEqual(result["answer"], "ANSWER: Ada")
         self.assertEqual(result["stages"], 1)
+
+    async def test_builder_third_identical_decision_stops(self):
+        notebook = ResearchNotebook()
+        notebook.set_conditions([{"id": "k1", "description": "identity"}])
+        notebook.builder_history = [
+            {"stage": 1, "best_guess": "Ada"}, {"stage": 2, "best_guess": "Ada"}]
+        async def fake_ask(*_args, **_kwargs):
+            return {"decision": "continue", "best_guess": "Ada", "objective": "more checking",
+                    "blocks": [{"id": "q", "type": "SEARCH", "params": {"queries": ["Ada"]}}]}
+        old = director_module.ask_json
+        director_module.ask_json = fake_ask
+        try:
+            plan = await director_module.build_stage("Who?", notebook, 3, 8)
+        finally:
+            director_module.ask_json = old
+        self.assertEqual(plan["decision"], "answer")
+        self.assertEqual(plan["blocks"], [])
 
     def test_verifier_rejected_candidates_recorded_in_summary(self):
         notebook = ResearchNotebook()

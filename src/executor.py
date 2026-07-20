@@ -99,7 +99,7 @@ async def _tool(block, observations=None):
             value = pages[0] if len(pages) == 1 else {"pages": pages, "urls": urls}
         elif kind == "READ_PDF": value = await read_pdf(p.get("url", ""), p.get("search", ""))
         elif kind == "CALCULATE": value = calculate(str(p.get("expression", "")))
-        else: value = await run_python(str(p.get("code", "")))
+        else: value = await run_python(str(p.get("code", "")), observations or {})
         result = {"_type": kind, "_branch_id": str(p.get("branch_id", "")).strip(), **value}
         record("tool_response", block_id=block.get("id"), tool=kind,
                seconds=round(time.monotonic() - started, 3), output=result)
@@ -121,6 +121,11 @@ def _ancestors(block, by_id, outputs):
     return found
 
 
+def _direct_dependencies(block, outputs):
+    """A node consumes its declared inputs; upstream transport is already consumed."""
+    return {node: outputs[node] for node in block["depends_on"] if node in outputs}
+
+
 async def execute_stage(question, plan, notebook, stage, build_node=None):
     blocks = normalize_graph(plan, stage)
     record("stage_graph", stage=stage, question=question, builder_output=plan, normalized_blocks=blocks)
@@ -136,7 +141,7 @@ async def execute_stage(question, plan, notebook, stage, build_node=None):
         if tool_nodes:
             async def timed_tool(block):
                 started = time.monotonic()
-                value = await _tool(block, _ancestors(block, by_id, outputs))
+                value = await _tool(block, _direct_dependencies(block, outputs))
                 value["_seconds"] = round(time.monotonic() - started, 2)
                 return value
             values = await asyncio.gather(*(timed_tool(block) for block in tool_nodes))
@@ -149,6 +154,7 @@ async def execute_stage(question, plan, notebook, stage, build_node=None):
             for key, value in fresh.items():
                 if value.get("_type") == "SEARCH":
                     notebook.add_search_leads({key: value})
+            notebook.store_evidence(stage, fresh)
             auditable = {key: value for key, value in fresh.items()
                          if useful(value) and value.get("_type") != "SEARCH"}
             if auditable:
@@ -161,7 +167,7 @@ async def execute_stage(question, plan, notebook, stage, build_node=None):
                    status="running", params=block["params"])
 
         async def run_solver(block):
-            observations = _ancestors(block, by_id, outputs)
+            observations = _direct_dependencies(block, outputs)
             p = block["params"]
             started = time.monotonic()
             try:
@@ -190,7 +196,7 @@ async def execute_stage(question, plan, notebook, stage, build_node=None):
             outputs[block["id"]] = value
             deps = [graph_ids[d] for d in block["depends_on"] if d in graph_ids] or ([build_node] if build_node else [])
             graph_ids[block["id"]] = notebook.add_node("SOLVE", {"stage": stage, "block_id": block["id"], "output": compact_source(value, 2400)}, deps)
-            observations = _ancestors(block, by_id, outputs)
+            observations = _direct_dependencies(block, outputs)
             allowed = {key for key, item in observations.items()
                        if isinstance(item, dict) and item.get("_type") not in {None, "SEARCH"}}
             added = notebook.integrate(value, observations, graph_ids[block["id"]], allowed)
@@ -209,7 +215,7 @@ async def execute_stage(question, plan, notebook, stage, build_node=None):
         for block in verify_nodes:
             record("block_status", stage=stage, block_id=block["id"], block_type="VERIFY",
                    status="running", params=block["params"])
-            observations = _ancestors(block, by_id, outputs)
+            observations = _direct_dependencies(block, outputs)
             candidate = str(block["params"].get("candidate", "")).strip()
             placeholder = bool(re.search(r"\b(?:best|candidate|dependency|solver|above|previous)\b", candidate, re.I))
             if block["params"].get("candidate_from_dependencies") or not candidate or placeholder:
@@ -220,6 +226,12 @@ async def execute_stage(question, plan, notebook, stage, build_node=None):
             if candidate:
                 sources = {key: compact_source(value, 2500) for key, value in observations.items()
                            if isinstance(value, dict) and value.get("_type") in TOOLS}
+                source_ids = {item.get("source_block_id") or item.get("source_id")
+                              for item in notebook.claims}
+                for passage in notebook.source_excerpts(source_ids):
+                    key = passage.get("source_block_id")
+                    sources.setdefault(key, {"_type": "EVIDENCE", "passages": []})
+                    sources[key]["passages"].append(passage)
                 value = await verify_answer(question, candidate, notebook.claims, sources,
                                             notebook.conditions, notebook.hypotheses, notebook.inferences)
             else:

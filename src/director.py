@@ -121,6 +121,7 @@ PLANNING
 3. Build the complete DAG that obtains and consumes those observations.
 4. State the expected observation and why this graph has information gain over prior actions.
 5. Stop when the current state already supports a best answer or further work cannot change ranking.
+If last_stage.consecutive_zero_stages is 2 or more, do not repeat the same tool path: make one materially different recovery graph using the recorded error/outcome. If no executable recovery path exists, answer with the best current candidate instead of spending the stage restating the gap. The stage ceiling is never a research target.
 
 SEARCH QUERY DESIGN
 Write 2-4 precise, genuinely complementary queries for each SEARCH node. Each query should retrieve one concrete node or relation. Preserve discriminating dates, names, domains, and relation direction; infer the likely source type and its natural wording. Do not make every query depend on the same quoted phrase, repeat prior zero-gain queries, use placeholders, or stuff the whole question into one query. Once concrete entities appear, pivot subsequent searches from those exact entities.
@@ -132,7 +133,7 @@ AVAILABLE NODES
 - FETCH {branch_id:"optional", urls_from_dependencies:true, auto_select:true, max_urls:5, search:"..."}
 - READ_PDF {branch_id:"optional", url:"https://...", search:"..."}
 - CALCULATE {expression:"..."}
-- PYTHON {code:"..."}
+- PYTHON {code:"..."} receives direct dependency outputs in the preloaded JSON-safe variable DATA. Use it for deterministic filtering, joins, ranking and calculation. Do not import networking/filesystem modules or make HTTP requests; retrieve data with SEARCH/FETCH first, then depend PYTHON on those nodes.
 - SOLVE {role:"relevant expert", task:"precise task"}
 - VERIFY {candidate:"...", candidate_from_dependencies:false}
 
@@ -140,6 +141,8 @@ GRAPH CONTRACT
 - Return 0-8 blocks with unique ids and valid depends_on edges.
 - Never invent URLs, observations, facts, candidates, or textual data plumbing.
 - Read failed_or_completed_actions; do not repeat zero-gain retrieval unchanged.
+- FETCH parses HTML, JSON, CSV/TSV, XLSX, DOCX and PDF. For long sources set `search` to the exact unresolved relation so evidence passages are centered correctly.
+- Every node receives only its declared direct dependencies. Connect PYTHON/SOLVE to every input it must join; do not rely on transitive ancestor leakage.
 - Use only condition ids already present in RESEARCH STATE.
 - A direct answer must use exactly `{"decision":"answer","best_guess":"exact requested value","blocks":[]}`.
 - Otherwise use decision:"continue" and provide an executable nonempty graph.
@@ -153,18 +156,19 @@ Each condition must be ONE independently verifiable subject–relation–object 
 Return {"conditions":[{"id":"k1","description":"..."}]}."""
 
 SOLVER_PROMPT = """You are a professional research adviser reporting to the Builder. Analyze only the focused task and supplied stage material. Do not orchestrate the research program or design another execution graph.
-Preserve verified facts; never overturn them without explicit contradictory evidence.
+Preserve verified facts; never overturn them without explicit contradictory evidence. Missing support means plausible/unsupported, never contradicted. Evidence that another candidate also matches is compatible support, not a contradiction. Mark a candidate contradicted only when a verified claim is logically incompatible with a required condition, and cite its claim id in contradiction_claim_ids.
 Candidate coverage is mandatory: scan every supplied result card and page before ranking. Include every concrete answer-type entity that matches at least one discriminating relation as a plausible candidate, even when it is only a search lead. Mark it plausible and explain the lead; do not omit it merely because it is not yet verified. This is candidate recall, not evidence promotion.
 First extract useful atomic direct claims from fetched pages. Every claim must include a short near-verbatim quote, the exact source_id/block id or page URL present in the dependency observations, mentioned entities, and relevant condition_ids. The program will reject claims whose quote is absent from that source. Search snippets are leads and cannot become claims.
-Then give the Builder a concise memo: what changed, ranked concrete candidates, the single decisive gap, and the best current guess. Always provide best_guess when any plausible candidate exists, even when evidence is incomplete.
+Then give the Builder only a short change summary, ranked concrete candidates, the single decisive gap, and the best current guess. Always provide best_guess when any plausible candidate exists, even when evidence is incomplete.
 If and only if YOUR TASK asks for retrieval strategy or query formulation, include 4-8 concise diverse web queries in queries. These are advice for a dependent SEARCH node, not an execution graph. Otherwise return an empty queries list.
 For ambiguous or existential bridge clues, preserve multiple alternatives. A best-known or first-found bridge is not a unique resolution.
 Only propose an answer when the evidence supports the exact entity and requested attribute.
 answer_candidate must be only the succinct value requested by the question: no explanation, confidence, aliases, parentheses, or location unless explicitly requested.
 Never propose an item in rejected_answers again unless a new verified claim directly supports it.
 Only concrete named entities are candidates. Keep an unidentified profile in gaps; never turn query-echo geography or a generic description into a hypothesis.
+Keep memo, why, decisive_gap and recommendation below 300 characters each. Return at most 12 claims and 12 candidates. Do not narrate the source-reading process or repeat evidence in prose.
 Return only this compact report:
-{"memo":"what changed and why","queries":[],"claims":[{"claim":"...","quote":"...","source_id":"...","entities":[],"condition_ids":[]}],"candidates":[{"name":"...","status":"supported|plausible|contradicted","why":"..."}],"decisive_gap":"...","recommendation":"...","best_guess":"..."}."""
+{"memo":"what changed and why","queries":[],"claims":[{"claim":"...","quote":"...","source_id":"...","entities":[],"condition_ids":[]}],"candidates":[{"name":"...","status":"supported|plausible|contradicted","why":"...","contradiction_claim_ids":[]}],"decisive_gap":"...","recommendation":"...","best_guess":"..."}."""
 
 VERIFIER_PROMPT = """You are the final Answer Verifier. You may accept or reject the Solver's exact candidate; you may not replace it.
 
@@ -174,11 +178,97 @@ Accept ONLY when ALL of these hold simultaneously:
 3. There is no unresolved contradiction on any required condition.
 
 Treat search leads as no evidence. Check that every derived inference actually follows from its cited premises; reject circular, unsupported, or fact-inventing derivations. Explicitly check each condition one by one. Reject if a decisive condition or identity link remains unsupported.
-Return {"accepted":false,"reason":"state which conditions are unverified and why the identity chain is broken."}."""
+Return {"accepted":false,"reason":"brief diagnosis","supported_condition_ids":[],"unsupported_condition_ids":[],"contradicted_condition_ids":[]}. A rejected answer may still contain supported components; preserve their supported conditions. Put a condition in contradicted_condition_ids only when cited evidence is logically incompatible with it, never merely because evidence is missing or another candidate also matches."""
 
 
 def _model(role, default=None):
     return env(f"{role}_MODEL") or default or env("OPENAI_MODEL")
+
+
+def _focused_excerpt(text, focus, limit=2500):
+    """Blend task-matched and stratified windows; avoid prefix-only information loss."""
+    text = re.sub(r"\s+", " ", str(text or "")).strip()
+    if len(text) <= limit:
+        return text
+    terms = list(dict.fromkeys(term.casefold() for term in re.findall(r"[\w-]+", focus)
+                              if len(term) >= 4))[:24]
+    lower, chunks = text.casefold(), []
+    positions = [lower.find(term) for term in terms if lower.find(term) >= 0]
+    if positions:
+        best = max(positions, key=lambda pos: sum(term in lower[max(0, pos-500):pos+1000]
+                                                  for term in terms))
+        chunks.append(text[max(0, best - 400):best + 1100])
+    width = max(260, (limit - sum(map(len, chunks))) // 3)
+    for i in range(3):
+        start = round(i * max(0, len(text) - width) / 2)
+        chunk = text[start:start + width]
+        if chunk and chunk not in chunks:
+            chunks.append(chunk)
+    return "\n...[excerpt]...\n".join(chunks)[:limit]
+
+
+def _solver_bundle(observations, focus=""):
+    """Role-specific ancestor view: keep candidate recall, drop SERP transport noise."""
+    bundle = {}
+    for key, value in observations.items():
+        if not isinstance(value, dict):
+            continue
+        if value.get("_type") == "SEARCH":
+            rows = value.get("results", [])
+            if len(rows) > 8:
+                tail = rows[5:]
+                positions = [round(i * (len(tail) - 1) / 2) for i in range(3)]
+                rows = rows[:5] + [tail[i] for i in positions]
+            queries = list(dict.fromkeys(str(item).strip() for item in value.get("queries", [])
+                                         if str(item).strip()))
+            if not queries:
+                queries = list(dict.fromkeys(str(item.get("query", "")).strip() for item in rows
+                                             if str(item.get("query", "")).strip()))
+            cards = []
+            for item in rows:
+                url = str(item.get("url", ""))
+                domain = re.sub(r"^www\.", "", re.sub(r"^https?://", "", url).split("/", 1)[0])
+                query = str(item.get("query", "")).strip()
+                cards.append({
+                    "title": str(item.get("title", ""))[:140],
+                    "snippet": str(item.get("snippet", ""))[:140],
+                    "domain": domain[:80], "rank": item.get("rank"),
+                    "query_id": queries.index(query) + 1 if query in queries else None,
+                })
+            bundle[key] = {"_type": "SEARCH", "queries": queries,
+                           "results": cards, "result_count": len(value.get("results", [])),
+                           "note": "Full URLs are persisted in ResearchNotebook leads."}
+        else:
+            clipped = compact_source(value, 2500)
+            if value.get("text"):
+                clipped["text"] = _focused_excerpt(value.get("text"), focus)
+            if isinstance(value.get("pages"), list):
+                clipped["pages"] = []
+                for page in value["pages"][:4]:
+                    compact = compact_source(page, 1800)
+                    if isinstance(page, dict) and page.get("text"):
+                        compact["text"] = _focused_excerpt(page.get("text"), focus, 1800)
+                    clipped["pages"].append(compact)
+            bundle[key] = clipped
+    return bundle
+
+
+def _bounded_bundle(bundle, limit=5500):
+    """Return valid JSON under budget; never cut serialized data mid-object."""
+    kept, omitted = {}, []
+    for key, value in bundle.items():
+        candidate = {**kept, key: value}
+        if len(json.dumps(candidate, ensure_ascii=False, default=str)) <= limit:
+            kept[key] = value
+            continue
+        smaller = compact_source(value, 1200)
+        if len(json.dumps({**kept, key: smaller}, ensure_ascii=False, default=str)) <= limit:
+            kept[key] = smaller
+        else:
+            omitted.append(key)
+    if omitted:
+        kept["_omitted"] = omitted
+    return json.dumps(kept, ensure_ascii=False, default=str)
 
 
 def _stage_one_language_ok(question, plan):
@@ -216,7 +306,7 @@ async def _model_question(question):
     for attempt in range(1, 4):
         try:
             modeled = await ask_json(CONDITION_PROMPT, f"QUESTION:\n{question}",
-                                     _model("DIRECTOR"), 3072)
+                                     _model("DIRECTOR"), 3072, attempts=1)
             if isinstance(modeled.get("conditions"), list) and modeled["conditions"]:
                 record("role_result", role="question_modeler", attempt=attempt,
                        input={"question": question}, output=modeled)
@@ -238,19 +328,23 @@ async def build_stage(question, notebook, stage, max_stages):
         modeled = await _model_question(question)
         notebook.set_conditions(modeled.get("conditions"))
     state = notebook.prompt()
-    user = f"QUESTION:\n{question}\n\nRESEARCH STATE:\n{state}\n\nSTAGE: {stage}/{max_stages}"
-    issues = []
-    for attempt in range(1, 4):
+    base_user = f"QUESTION:\n{question}\n\nRESEARCH STATE:\n{state}\n\nSTAGE: {stage}/{max_stages}"
+    user, issues, model_failures, validation_attempt = base_user, [], 0, 0
+    while validation_attempt < 3:
         try:
-            plan = await ask_json(GRAPH_BUILDER_PROMPT, user, _model("DIRECTOR"), 4096)
+            plan = await ask_json(GRAPH_BUILDER_PROMPT, user, _model("DIRECTOR"), 4096, attempts=1)
             record("role_result", role="builder", stage=stage,
                    input={"question": question, "research_state": state,
                           "stage": stage, "max_stages": max_stages}, output=plan)
         except Exception as exc:
+            model_failures += 1
             issues = [f"model_error:{type(exc).__name__}"]
-            print(f"[BUILDER RETRY] attempt {attempt}/3 failed: {issues[0]}; retrying", flush=True)
-            user += f"\n\nThe previous build call failed ({issues[0]}). Return only the compact valid graph JSON now."
+            print(f"[BUILDER RETRY] model call {model_failures}/3 failed: {issues[0]}; retrying", flush=True)
+            if model_failures >= 3:
+                break
+            await asyncio.sleep(model_failures)
             continue
+        validation_attempt += 1
         language_ok = _stage_one_language_ok(question, plan)
         answering = plan.get("decision") == "answer" and bool(str(plan.get("best_guess", "")).strip())
         blocks = plan.get("blocks")
@@ -261,30 +355,65 @@ async def build_stage(question, notebook, stage, max_stages):
                                         ("retrieval_queries", retrieval_ok),
                                         ("language", language_ok)) if not ok]
         if not issues:
+            guess = str(plan.get("best_guess", "")).strip()
+            prior = [str(item.get("best_guess", "")).strip() for item in notebook.builder_history[-2:]]
+            if (plan.get("decision") != "answer" and guess and len(prior) == 2
+                    and prior[0].casefold() == prior[1].casefold() == guess.casefold()):
+                plan.update({"decision": "answer", "blocks": [],
+                             "rationale": (str(plan.get("rationale", "")) +
+                                           " The Builder selected the same answer for three consecutive decisions; stop.").strip()})
             return plan
-        print(f"[BUILDER RETRY] attempt {attempt}/3 violated: {', '.join(issues)}; retrying", flush=True)
-        user += f"\n\nYour previous output violated: {', '.join(issues)}. Every stage must use the question language unless evidence establishes another locale. Rebuild a valid executable graph."
+        print(f"[BUILDER RETRY] graph {validation_attempt}/3 violated: {', '.join(issues)}; retrying", flush=True)
+        repair = (
+            f"Your previous JSON violated: {', '.join(issues)}.\n"
+            f"INVALID JSON:\n{json.dumps(plan, ensure_ascii=False, default=str)[:6000]}\n\n"
+            "Repair it without changing the research conclusion. If answering, return exactly "
+            '{"decision":"answer","best_guess":"exact requested value","blocks":[]}. '
+            "If continuing, every block must be exactly shaped as "
+            '{"id":"unique","type":"SEARCH|BROWSE|FETCH|READ_PDF|CALCULATE|PYTHON|SOLVE|VERIFY",'
+            '"params":{},"depends_on":[]}; SEARCH/BROWSE queries belong inside params.queries. '
+            "Return only the corrected contract JSON."
+        )
+        user = f"{base_user}\n\n{repair}"
     raise ValueError(f"Builder returned no executable graph ({', '.join(issues)})")
 
 
 async def solve_node(question, task, role, notebook, observations):
-    bundle = {key: compact_source(value, 8000 if value.get("_type") == "SEARCH" else 3500)
-              for key, value in observations.items()}
-    user = f"QUESTION:\n{question}\n\nYOUR ROLE: {role}\nYOUR TASK: {task}\n\nRESEARCH STATE:\n{notebook.solver_state()}\n\nDEPENDENCY OBSERVATIONS:\n{json_text(bundle, 26000)}"
-    transient = (APIConnectionError, APITimeoutError, TimeoutError, ConnectionError)
-    for attempt in range(1, 4):
+    bundle = _solver_bundle(observations, f"{question}\n{task}")
+    state = notebook.solver_state()
+    dependencies = _bounded_bundle(bundle)
+    user = f"QUESTION:\n{question}\n\nYOUR ROLE: {role}\nYOUR TASK: {task}\n\nRESEARCH STATE:\n{state}\n\nDEPENDENCY OBSERVATIONS:\n{dependencies}"
+    approx_tokens = (len(SOLVER_PROMPT) + len(user) + 2) // 3
+    print(f"  [SOLVER INPUT] {len(user)} chars | ≈{approx_tokens} tokens", flush=True)
+    record("role_input_budget", role="solver", chars=len(user), approx_tokens=approx_tokens,
+           state_chars=len(state), dependency_chars=len(dependencies))
+    recoverable = (APIConnectionError, APITimeoutError, TimeoutError, ConnectionError,
+                   RuntimeError, ValueError, json.JSONDecodeError)
+    primary_model = _model("SOLVER")
+    primary_tokens = (int(env("DEEPSEEK_SOLVER_MAX_TOKENS", 8192))
+                      if str(primary_model).startswith("deepseek") else 4096)
+    for attempt in range(1, 3):
         try:
-            result = await ask_json(SOLVER_PROMPT, user, _model("SOLVER"), 4096)
+            result = await ask_json(SOLVER_PROMPT, user, primary_model, primary_tokens, attempts=1)
             record("role_result", role="solver", input={"question": question, "role": role,
                    "task": task, "research_state": notebook.solver_state(),
                    "dependency_observations": bundle}, output=result)
             return result
-        except transient as exc:
-            action = "retrying GPT" if attempt < 3 else "switching to deepseek-v4-pro"
-            print(f"  [SOLVE RETRY] attempt {attempt}/3 failed: {type(exc).__name__}; {action}", flush=True)
-            if attempt < 3:
+        except recoverable as exc:
+            action = "retrying GPT" if attempt < 2 else "switching to deepseek-v4-pro"
+            print(f"  [SOLVE RETRY] attempt {attempt}/2 failed: {type(exc).__name__}: "
+                  f"{str(exc)[:160]}; {action}", flush=True)
+            record("role_error", role="solver", attempt=attempt,
+                   input={"question": question, "role": role, "task": task,
+                          "research_state": notebook.solver_state(),
+                          "dependency_observations": bundle},
+                   error=f"{type(exc).__name__}: {exc}")
+            if attempt < 2:
                 await asyncio.sleep(attempt)
-    report = await ask_json(SOLVER_PROMPT, user, _model("FALLBACK_SOLVER", "deepseek-v4-pro"), 4096)
+    fallback_model = _model("FALLBACK_SOLVER", "deepseek-v4-pro")
+    fallback_tokens = (int(env("DEEPSEEK_SOLVER_MAX_TOKENS", 8192))
+                       if str(fallback_model).startswith("deepseek") else 4096)
+    report = await ask_json(SOLVER_PROMPT, user, fallback_model, fallback_tokens, attempts=1)
     record("role_result", role="solver_fallback", input={"question": question, "role": role,
            "task": task, "research_state": notebook.solver_state(),
            "dependency_observations": bundle}, output=report)
@@ -293,6 +422,28 @@ async def solve_node(question, task, role, notebook, observations):
 
 
 async def verify_answer(question, candidate, claims, sources, conditions=None, hypotheses=None, inferences=None):
+    """Verify one candidate against its proof slice, never the whole notebook."""
+    candidate_key = candidate.casefold()
+    candidate_hypotheses = [item for item in (hypotheses or [])
+                            if str(item.get("entity", "")).casefold() in candidate_key
+                            or candidate_key in str(item.get("entity", "")).casefold()]
+    cited_ids = {evidence for item in candidate_hypotheses
+                 for cover in item.get("coverage", []) if isinstance(cover, dict)
+                 for evidence in cover.get("evidence_ids", [])}
+    selected_claims = [item for item in claims if item.get("id") in cited_ids or any(
+        str(entity).casefold() in candidate_key or candidate_key in str(entity).casefold()
+        for entity in item.get("entities", []))]
+    if not selected_claims:
+        selected_claims = list(claims)[-12:]
+    selected_claims = selected_claims[-16:]
+    claim_ids = {item.get("id") for item in selected_claims}
+    selected_inferences = [item for item in (inferences or [])
+                           if item.get("id") in cited_ids or claim_ids.intersection(item.get("premise_ids", []))][-8:]
+    source_keys = {str(item.get("source_block_id") or item.get("source_id") or "")
+                   for item in selected_claims}
+    selected_sources = {key: value for key, value in sources.items() if key in source_keys}
+    if not selected_sources:
+        selected_sources = dict(list(sources.items())[-4:])
     condition_checklist = "\n".join(
         f"{i+1}. [{c.get('id', '?')}] {c.get('description', '')}"
         for i, c in enumerate((conditions or [])[:16])
@@ -300,17 +451,22 @@ async def verify_answer(question, candidate, claims, sources, conditions=None, h
     user = (
         f"QUESTION:\n{question}\n\n"
         f"ATOMIC CONDITIONS (every one must be verified):\n{condition_checklist}\n\n"
-        f"CANDIDATE COVERAGE GRAPH:\n{json_text(hypotheses or [], 12000)}\n\n"
+        f"CANDIDATE COVERAGE GRAPH:\n{json_text(candidate_hypotheses, 5000)}\n\n"
         f"CANDIDATE:\n{candidate}\n\n"
-        f"CITED VERIFIED CLAIMS:\n{json_text(claims, 18000)}\n\n"
-        f"CITED DERIVED INFERENCES (validate every premise edge):\n{json_text(inferences or [], 12000)}\n\n"
-        f"SOURCE EXCERPTS:\n{json_text(sources, 24000)}\n\n"
+        f"CITED VERIFIED CLAIMS:\n{json_text(selected_claims, 8000)}\n\n"
+        f"CITED DERIVED INFERENCES (validate every premise edge):\n{json_text(selected_inferences, 5000)}\n\n"
+        f"SOURCE EXCERPTS:\n{json_text(selected_sources, 8000)}\n\n"
         f"Check each condition above. For each one, state whether the cited claims prove it. "
         f"Only accept if EVERY condition is proven AND the identity chain is closed "
         f"(the candidate IS the entity the question asks about, not just someone with a matching attribute)."
     )
     result = await ask_json(VERIFIER_PROMPT, user, _model("VERIFIER"), 2048)
+    valid_condition_ids = {str(item.get("id", "")) for item in (conditions or [])}
+    for key in ("supported_condition_ids", "unsupported_condition_ids", "contradicted_condition_ids"):
+        values = result.get(key) if isinstance(result.get(key), list) else []
+        result[key] = list(dict.fromkeys(str(value) for value in values
+                                         if str(value) in valid_condition_ids))
     record("role_result", role="verifier", input={"question": question, "candidate": candidate,
-           "claims": claims, "sources": sources, "conditions": conditions or [],
-           "hypotheses": hypotheses or [], "inferences": inferences or []}, output=result)
+           "claims": selected_claims, "sources": selected_sources, "conditions": conditions or [],
+           "hypotheses": candidate_hypotheses, "inferences": selected_inferences}, output=result)
     return result

@@ -74,9 +74,13 @@ async def research(question: str, max_stages: int = 8) -> dict:
             stage_trace = {"stage": stage, "build_node": build_node, "objective": plan.get("objective", ""),
                            "rationale": plan.get("rationale", ""), "nodes": nodes}
 
-            guesses = [_candidate(value.get("best_guess") or value.get("answer_candidate"))
-                       for value in outputs.values() if isinstance(value, dict)]
-            fallback = next((guess for guess in reversed(guesses) if guess), fallback)
+            # Solver is an adviser. Its guess reaches the next Builder through
+            # notebook memory, but cannot silently replace the Builder's answer.
+            # Use it only when no Builder has produced any candidate at all.
+            if not fallback:
+                guesses = [_candidate(value.get("best_guess") or value.get("answer_candidate"))
+                           for value in outputs.values() if isinstance(value, dict)]
+                fallback = next((guess for guess in reversed(guesses) if guess), fallback)
             accepted = next((value for value in outputs.values() if isinstance(value, dict)
                              and value.get("_type") == "VERIFY" and value.get("accepted")), None)
             if accepted:

@@ -3,12 +3,14 @@
 import asyncio
 import ast
 import io
+import json
 import math
 import os
 import re
 import sys
 import tempfile
 import zipfile
+import xml.etree.ElementTree as ET
 from urllib.parse import unquote, urljoin, urlparse, urlunparse
 
 import httpx
@@ -18,23 +20,23 @@ from .recorder import record
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 
-_brave_client = None
-_brave_gate = asyncio.Semaphore(4)
-
-
-def _get_brave_client():
-    global _brave_client
-    if _brave_client is None or _brave_client.is_closed:
-        _brave_client = httpx.AsyncClient(timeout=20, follow_redirects=True)
-    return _brave_client
+def _get_brave_runtime():
+    """HTTP clients and asyncio primitives belong to their creating event loop."""
+    loop = asyncio.get_running_loop()
+    runtime = getattr(loop, "_blockresearch_brave_runtime", None)
+    if runtime is None or runtime[0].is_closed:
+        runtime = (httpx.AsyncClient(timeout=20, follow_redirects=True), asyncio.Semaphore(4))
+        setattr(loop, "_blockresearch_brave_runtime", runtime)
+    return runtime
 
 
 async def _brave_get(query, count):
     """Reuse connections and retry only timeouts, network errors, 429 and 5xx."""
     for attempt in range(1, 4):
         try:
-            async with _brave_gate:
-                response = await _get_brave_client().get(
+            client, gate = _get_brave_runtime()
+            async with gate:
+                response = await client.get(
                     "https://api.search.brave.com/res/v1/web/search",
                     params={"q": query, "count": count, "extra_snippets": "true"},
                     headers={"X-Subscription-Token": env("BRAVE_API_KEY"), "Accept": "application/json"})
@@ -134,6 +136,48 @@ def _docx_text(content):
         return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", xml)).strip()
     except Exception:
         return ""
+
+
+def _xlsx_text(content):
+    """Extract worksheet cells as TSV without adding a heavyweight dependency."""
+    if not content.startswith(b"PK"):
+        return ""
+    try:
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            names = set(archive.namelist())
+            shared = []
+            if "xl/sharedStrings.xml" in names:
+                root = ET.fromstring(archive.read("xl/sharedStrings.xml"))
+                shared = ["".join(node.itertext()) for node in root]
+            sheets = sorted(name for name in names
+                            if re.fullmatch(r"xl/worksheets/sheet\d+\.xml", name))[:4]
+            lines = []
+            for sheet in sheets:
+                root = ET.fromstring(archive.read(sheet))
+                for row in root.iter():
+                    if not row.tag.endswith("}row"):
+                        continue
+                    values = []
+                    for cell in row:
+                        if not cell.tag.endswith("}c"):
+                            continue
+                        kind = cell.attrib.get("t")
+                        raw = next((node.text or "" for node in cell.iter()
+                                    if node.tag.endswith("}v") or node.tag.endswith("}t")), "")
+                        if kind == "s" and raw.isdigit() and int(raw) < len(shared):
+                            raw = shared[int(raw)]
+                        values.append(_clean_cell(raw))
+                    if any(values):
+                        lines.append("\t".join(values))
+                    if sum(len(line) for line in lines) > 60000:
+                        break
+            return "\n".join(lines)
+    except Exception:
+        return ""
+
+
+def _clean_cell(value):
+    return re.sub(r"\s+", " ", str(value or "")).strip()
 
 
 def _passage(text, search, window=3000):
@@ -283,8 +327,20 @@ async def fetch_page(url: str, search: str = "") -> dict:
         docx = _docx_text(response.content)
         if docx:
             return {"url": str(response.url), "text": docx[:36000], "links": []}
+        content_type = response.headers.get("content-type", "").lower()
+        if urlparse(str(response.url)).path.lower().endswith(".xlsx") or "spreadsheet" in content_type:
+            xlsx = _xlsx_text(response.content)
+            if xlsx:
+                result = {"url": str(response.url), "text": xlsx[:60000], "format": "xlsx-tsv", "links": []}
+                passage, score = _passage(xlsx, search)
+                if score:
+                    result["search_hits"] = [{"term": "dense match", "text": passage}]
+                return result
+            return {"error": "unable to parse XLSX", "url": str(response.url), "text": "", "links": []}
         if "json" in response.headers.get("content-type", ""):
             return {"url": str(response.url), "data": response.json()}
+        if "csv" in content_type or urlparse(str(response.url)).path.lower().endswith((".csv", ".tsv")):
+            return {"url": str(response.url), "text": response.text[:60000], "format": "delimited-text", "links": []}
 
         soup = BeautifulSoup(response.text, "html.parser")
         for tag in soup(["script", "style", "nav", "footer", "header", "noscript"]):
@@ -380,7 +436,7 @@ def calculate(expression: str) -> dict:
         return {"error": str(exc)}
 
 
-async def run_python(code: str) -> dict:
+async def run_python(code: str, data=None) -> dict:
     safe_modules = {"math", "statistics", "fractions", "decimal", "itertools", "collections", "functools"}
     banned = {"open", "eval", "exec", "compile", "input", "breakpoint", "globals", "locals", "vars", "__import__"}
     try:
@@ -397,11 +453,14 @@ async def run_python(code: str) -> dict:
             if isinstance(node, ast.Attribute) and node.attr.startswith("_"):
                 raise ValueError("unsafe attribute")
         with tempfile.TemporaryDirectory() as workdir:
+            wrapper = "import json,sys\nDATA=json.load(sys.stdin)\n" + code
             process = await asyncio.create_subprocess_exec(
-                sys.executable, "-I", "-c", code, cwd=workdir, env={},
+                sys.executable, "-I", "-c", wrapper, cwd=workdir, env={},
+                stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             )
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=10)
+            payload = json.dumps(data or {}, ensure_ascii=False, default=str).encode()
+            stdout, stderr = await asyncio.wait_for(process.communicate(payload), timeout=15)
         return {"code": code, "stdout": stdout.decode()[:12000], "stderr": stderr.decode()[:3000], "exit_code": process.returncode}
     except Exception as exc:
         return {"code": code, "error": str(exc)}

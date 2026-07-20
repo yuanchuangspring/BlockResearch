@@ -14,12 +14,15 @@ eval_traces/
 memory/
 HANDOFF.md
 PROGRESS.md
+EVAL.md
 intro.md
 analyze_traces.py
+eval_*.py
 eval_browsecomp.py
 eval_gaia.py
 eval_retrieval.py
 eval_sets.json
+submit/
 课题要求.md
 README.md
 README_CN.md
