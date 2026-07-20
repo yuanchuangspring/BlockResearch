@@ -5,7 +5,7 @@
 <em>Research While Building — Stage-wise dynamic graph construction for evidence-grounded deep research</em>
 
 [![Python](https://img.shields.io/badge/python-3.10+-blue?style=flat-square)](https://www.python.org/)
-[![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)](LICENSE)
+[![License](https://img.shields.io/github/license/yuanchuangspring/BlockResearch?style=flat-square)](LICENSE)
 
 [English](./README.md) | [中文文档](./README_CN.md)
 
