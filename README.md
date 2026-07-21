@@ -1,14 +1,22 @@
 <div align="center">
 
 <img src="static/title.png" alt="BlockResearch" height="56">
-&nbsp;&nbsp;
+<br>
 <em>Research while building — dynamic execution graphs for evidence-grounded deep research</em>
 
 [![Python](https://img.shields.io/badge/python-3.10+-blue?style=flat-square)](https://www.python.org/)
 [![Tests](https://img.shields.io/badge/tests-77%20passed-brightgreen?style=flat-square)](#testing)
 [![License](https://img.shields.io/github/license/yuanchuangspring/BlockResearch?style=flat-square)](LICENSE)
 
-[English](./README.md) | [中文文档](./README_CN.md) · [Quick Start](#quick-start) · [Architecture](#architecture) · [Web Demo](#web-demo)
+[English](./README.md) | [中文文档](./README_CN.md)
+<br>
+[Quick Start](#quick-start) · [Architecture](#architecture) · [Web Demo](#web-demo)
+
+</div>
+
+<div align="center">
+
+<img src="static/%E5%9B%BE%E7%89%871.png" alt="BlockResearch concept" width="760">
 
 </div>
 
@@ -138,12 +146,6 @@ Run a research question:
 ```
 
 Open [http://localhost:8000](http://localhost:8000). The interface provides model and role configuration, live stage updates over SSE, graph-focused execution playback, evidence inspection, and final answers.
-
-<div align="center">
-
-<img src="static/%E5%9B%BE%E7%89%871.png" alt="BlockResearch concept" width="760">
-
-</div>
 
 ## Project structure
 
