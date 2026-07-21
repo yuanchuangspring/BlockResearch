@@ -30,13 +30,7 @@ Deep-research agents often lock onto an early candidate and spend the rest of th
 
 ## Demo
 
-<div align="center">
-
-<video src="./static/demo.mov" controls muted width="760"></video>
-
-[Watch the local demo video](./static/demo.mov)
-
-</div>
+https://github.com/user-attachments/assets/8880e14e-a5fd-4d8f-a63b-864f4e399109
 
 The web interface streams each stage, block, dependency, query, source, and decision as the graph evolves.
 
