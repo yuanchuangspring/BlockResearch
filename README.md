@@ -5,7 +5,6 @@
 <em>Research while building — dynamic execution graphs for evidence-grounded deep research</em>
 
 [![Python](https://img.shields.io/badge/python-3.10+-blue?style=flat-square)](https://www.python.org/)
-[![Tests](https://img.shields.io/badge/tests-77%20passed-brightgreen?style=flat-square)](#testing)
 [![License](https://img.shields.io/github/license/yuanchuangspring/BlockResearch?style=flat-square)](LICENSE)
 
 [English](./README.md) | [中文文档](./README_CN.md)
