@@ -15,7 +15,7 @@
 
 <div align="center">
 
-<img src="static/%E5%9B%BE%E7%89%871.png" alt="BlockResearch concept" width="760">
+<img src="static/main_figure.png" alt="BlockResearch concept" width="760">
 
 </div>
 
