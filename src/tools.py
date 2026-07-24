@@ -370,6 +370,22 @@ async def fetch_page(url: str, search: str = "") -> dict:
         terms = sorted(set(term.lower() for term in re.findall(r"[\w-]+", search) if len(term) > 2),
                        key=len, reverse=True)
         hits, centers = [], []
+        # Preserve complete matching table slices as one observation. Ordinary
+        # prose windows are unsuitable for exhaustive list/count questions: a
+        # long table can otherwise be reduced to a few scattered example rows.
+        table_rows = []
+        for row in soup.select("tr"):
+            cells = [cell.get_text(" ", strip=True) for cell in row.select("th,td")]
+            line = "\t".join(cell for cell in cells if cell)
+            if line:
+                table_rows.append(line)
+        for term in terms:
+            matched = [line for line in table_rows if term in line.lower()]
+            if len(matched) >= 2:
+                hits.append({"term": f"table:{term}", "text": "\n".join(matched)[:12000],
+                             "row_count": len(matched)})
+                if len(hits) >= 4:
+                    break
         passage, score = _passage(text, search)
         if score:
             hits.append({"term": "dense match", "text": passage})

@@ -15,6 +15,14 @@ def _candidate(value):
     return "" if candidate.lower() in {"none", "unknown", "no match", "no match found", "not found", "n/a"} else candidate
 
 
+def _verifier_rejected(notebook, candidate):
+    """Whether the latest verdict for this exact answer rejected it."""
+    key = _candidate(candidate).casefold()
+    verdict = next((item for item in reversed(notebook.verification_history)
+                    if _candidate(item.get("candidate")).casefold() == key), None)
+    return bool(key and verdict and not verdict.get("accepted"))
+
+
 def _stage_stats(outputs, nodes):
     """Count tool successes and failures from stage outputs."""
     successful, failed = 0, 0
@@ -42,7 +50,8 @@ async def research(question: str, max_stages: int = 8) -> dict:
             fallback = _candidate(plan.get("best_guess")) or fallback
             notebook.set_conditions(plan.get("conditions"))
             notebook.record_builder(stage, plan)
-            if plan.get("decision") == "answer" and fallback and not plan.get("blocks"):
+            if (plan.get("decision") == "answer" and fallback and not plan.get("blocks")
+                    and not _verifier_rejected(notebook, fallback)):
                 notebook.answer = fallback
                 return _result(f"ANSWER: {fallback}", stage, trace, all_outputs, notebook)
             blocks = normalize_graph(plan, stage)
@@ -87,7 +96,7 @@ async def research(question: str, max_stages: int = 8) -> dict:
                 notebook.answer = accepted["candidate"]
                 trace.append(stage_trace)
                 return _result(f"ANSWER: {accepted['candidate']}", stage, trace, all_outputs, notebook)
-            if plan.get("decision") == "answer" and fallback:
+            if plan.get("decision") == "answer" and fallback and not _verifier_rejected(notebook, fallback):
                 notebook.answer = fallback
                 trace.append(stage_trace)
                 return _result(f"ANSWER: {fallback}", stage, trace, all_outputs, notebook)
@@ -97,5 +106,7 @@ async def research(question: str, max_stages: int = 8) -> dict:
             trace.append({"stage": stage, "error": error})
             return _result("", stage, trace, all_outputs, notebook, error)
 
-    answer = fallback or "NEEDS_EVIDENCE: no supported answer candidate"
-    return _result(f"ANSWER: {answer}" if fallback else answer, max_stages, trace, all_outputs, notebook)
+    answer = fallback if fallback and not _verifier_rejected(notebook, fallback) else ""
+    answer = answer or "NEEDS_EVIDENCE: no supported answer candidate"
+    return _result(f"ANSWER: {answer}" if not answer.startswith("NEEDS_EVIDENCE:") else answer,
+                   max_stages, trace, all_outputs, notebook)

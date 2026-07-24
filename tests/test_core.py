@@ -1,6 +1,6 @@
 import unittest
 import json
-import io, zipfile
+import asyncio, io, zipfile
 
 from src import main
 import src.executor as executor
@@ -12,6 +12,8 @@ from src.director import _retrieval_inputs_ok, _solver_bundle, _stage_one_langua
 from src.research import _candidate
 from src.notebook import ResearchNotebook
 from src.tools import _docx_text, _xlsx_text, _expand_queries, _merge_results, _passage, calculate, run_python
+from src.context import compact_source, preview_one
+from src.llm import _consume_stream
 from src.retrieval import _compact_cards
 
 
@@ -29,6 +31,11 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
 
     def test_answer_extraction(self):
         self.assertEqual(main.extract_answer("ANSWER: 109 — EURO 2016"), "109 — EURO 2016")
+
+    def test_answer_extraction_preserves_long_complete_lists(self):
+        answer = "group: " + ", ".join(f"item-{i}" for i in range(80))
+        self.assertGreater(len(answer), 200)
+        self.assertEqual(main.extract_answer(f"ANSWER: {answer}"), answer)
 
     def test_stage_graph_does_not_force_a_solver(self):
         graph = normalize_graph({"blocks": [{"id": "q", "type": "BROWSE", "params": {"queries": ["x"]}}]}, 2)
@@ -136,15 +143,20 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
     async def test_builder_rejects_noncontract_answer_then_accepts_standard_answer(self):
         outputs = [{"conditions": [{"id": "k1", "description": "song"}]},
                    {"song": "Porz Goret"},
-                   {"decision": "answer", "best_guess": "Porz Goret", "blocks": []}]
+                   {"decision": "answer", "answer_complete": True,
+                    "best_guess": "Porz Goret", "blocks": []}]
         async def fake_ask(*_args, **_kwargs): return outputs.pop(0)
         old = director_module.ask_json
         director_module.ask_json = fake_ask
+        notebook = ResearchNotebook()
+        notebook.store_evidence(0, {"seed": {"_type": "FETCH", "url": "https://example.test",
+                                              "text": "The song is Porz Goret."}})
         try:
-            plan = await director_module.build_stage("What song?", ResearchNotebook(), 1, 8)
+            plan = await director_module.build_stage("What song?", notebook, 1, 8)
         finally:
             director_module.ask_json = old
-        self.assertEqual(plan, {"decision": "answer", "best_guess": "Porz Goret", "blocks": []})
+        self.assertEqual(plan, {"decision": "answer", "answer_complete": True,
+                                "best_guess": "Porz Goret", "blocks": []})
         self.assertFalse(outputs)
 
     def test_no_match_sentinel_is_not_an_answer(self):
@@ -491,6 +503,25 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
             director_module.ask_json, director_module._model = old_ask, old_model
         self.assertEqual(seen["max_tokens"], 8192)
 
+    async def test_deepseek_length_retry_doubles_output_budget(self):
+        budgets = []
+        async def fake_ask(_system, _user, _model, max_tokens, **_kwargs):
+            budgets.append(max_tokens)
+            if len(budgets) == 1:
+                raise RuntimeError("model produced no final answer (finish_reason=length)")
+            return {"memo": "ok", "claims": [], "candidates": [], "best_guess": "Ada"}
+        async def no_sleep(*_args): pass
+        old_ask, old_model, old_sleep = director_module.ask_json, director_module._model, director_module.asyncio.sleep
+        director_module.ask_json = fake_ask
+        director_module._model = lambda role, default=None: "deepseek-v4-pro"
+        director_module.asyncio.sleep = no_sleep
+        try:
+            result = await director_module.solve_node("Who?", "answer", "expert", ResearchNotebook(), {})
+        finally:
+            director_module.ask_json, director_module._model, director_module.asyncio.sleep = old_ask, old_model, old_sleep
+        self.assertEqual(budgets, [8192, 16384])
+        self.assertEqual(result["best_guess"], "Ada")
+
     async def test_solver_receives_direct_dependencies_not_redundant_ancestors(self):
         seen = {}
         async def fake_tool(block, _observations=None):
@@ -661,6 +692,84 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
         notebook.leads.append({"id": "c1", "claim": "SEO noise", "level": "lead", "source_id": "s"})
         self.assertNotIn("SEO noise", notebook.solver_state())
 
+    def test_solver_bundle_budget_preserves_every_direct_dependency(self):
+        bundle = {
+            "search": {"_type": "SEARCH", "queries": ["q"], "results": [
+                {"title": "candidate", "snippet": "A" * 300 + "Bana dynasty",
+                 "domain": "example.test", "rank": 1}] * 8},
+            "fetch_identity": {"_type": "FETCH", "pages": [{
+                "url": "https://example.test/kundavai",
+                "text": "X" * 2200 + "Rajaraja's sister married Vandiyadevan of the Bana dynasty"}]},
+            "fetch_count": {"_type": "FETCH", "pages": [{
+                "url": "https://example.test/bana",
+                "text": "Y" * 1800 + "The list contains 10 known kings"}]},
+        }
+        packed = director_module._bounded_bundle(bundle, 5500)
+        self.assertLessEqual(len(packed), 5500)
+        self.assertIn("Vandiyadevan", packed)
+        self.assertIn("10 known kings", packed)
+        self.assertNotIn("_omitted", packed)
+
+    def test_solver_bundle_selects_relevant_late_fetch_page(self):
+        pages = [{"url": f"https://example.test/noise-{i}",
+                  "text": "generic unrelated bibliography" * 80} for i in range(6)]
+        pages[-1] = {"url": "https://example.test/cv", "text":
+                     "First publication in The Practitioner: Decisive Article Title"}
+        bundle = director_module._solver_bundle(
+            {"fetch": {"_type": "FETCH", "pages": pages}},
+            "identify the first publication in The Practitioner")
+        packed = director_module._bounded_bundle(bundle, 3000)
+        self.assertIn("Decisive Article Title", packed)
+
+    def test_solver_bundle_selects_relevant_middle_pdf_hit(self):
+        hits = [{"page": i, "text": "generic bibliography" * 80} for i in range(16)]
+        hits[7] = {"page": 36, "text":
+                   "First publication in The Practitioner: Decisive Middle Hit"}
+        observations = {"fetch": {"_type": "FETCH", "pages": [{
+            "url": "https://example.test/cv.pdf", "text": "CV", "search_hits": hits}]}}
+        bundle = director_module._solver_bundle(
+            observations, "identify first publication in The Practitioner")
+        packed = director_module._bounded_bundle(bundle, 3000)
+        self.assertIn("Decisive Middle Hit", packed)
+
+    def test_solver_bundle_prioritizes_enumerated_ruler_passage(self):
+        names = "Jayanandivarman\nVijayaditya I, son of Jayanandivarman\nMalladeva, son of Vijayaditya I\nVallavaraiyan Vandiyadevan"
+        bundle = {"fetch": {"_type": "FETCH", "pages": [{
+            "url": "https://example.test/bana", "text": "generic history " * 300,
+            "search_hits": [
+                {"term": "known", "text": "generic known history " * 100},
+                {"term": "kings", "text": names},
+            ]}]}}
+        packed = director_module._bounded_bundle(bundle, 3000)
+        self.assertIn("Jayanandivarman", packed)
+        self.assertIn("Vallavaraiyan Vandiyadevan", packed)
+
+    def test_solver_search_card_keeps_relation_match_beyond_snippet_prefix(self):
+        snippet = ("张合静，硕士研究生，研究工作被ICASSP接收。" + "背景介绍。" * 80 +
+                   "王文博，哈尔滨工业大学博士研究生，该研究工作被人工智能顶会AAAI 2024接收。")
+        observations = {"search": {"_type": "SEARCH", "queries": ["智汇论坛 博士研究生 顶会接收"],
+                                   "results": [{"title": "智汇论坛", "snippet": snippet,
+                                                "url": "https://example.test/forum", "rank": 1}]}}
+        bundle = director_module._solver_bundle(observations, "哪位博士研究生的研究工作被顶尖会议接收")
+        packed = director_module._bounded_bundle(bundle, 3000)
+        self.assertIn("王文博", packed)
+        self.assertIn("AAAI 2024", packed)
+
+    def test_solver_bundle_keeps_competing_directional_relations(self):
+        observations = {"search": {"_type": "SEARCH", "queries": ["S16 棋士证书 同时开启"],
+            "results": [
+                {"title": "3月14日公告", "snippet": "S17赛季棋士证书和S16新赛季同时开启，持续12周。",
+                 "url": "https://example.test/march", "rank": 1},
+                {"title": "1月13日公告", "snippet": "S16赛季棋士证书和S16新赛季同时开启，持续8周。",
+                 "url": "https://example.test/january", "rank": 2}]}}
+        bundle = director_module._solver_bundle(
+            observations, "哪一个新赛季开始时间与S16赛季棋士证书同时开启，并持续多少周")
+        packed = director_module._bounded_bundle(bundle, 3000)
+        self.assertIn("S17赛季棋士证书和S16新赛季", packed)
+        self.assertIn("持续12周", packed)
+        self.assertIn("S16赛季棋士证书和S16新赛季", packed)
+        self.assertIn("持续8周", packed)
+
     def test_unextracted_source_survives_as_cross_stage_evidence(self):
         notebook = ResearchNotebook()
         text = "A" * 1700 + "MIDDLE CANDIDATE" + "B" * 3300 + "TAIL FACT"
@@ -669,6 +778,77 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("evidence_frontier", state)
         self.assertIn("MIDDLE CANDIDATE", state)
         self.assertIn("TAIL FACT", state)
+
+    def test_search_hits_do_not_discard_decisive_middle_table_row(self):
+        notebook = ResearchNotebook()
+        text = "HEADER match " + "A" * 2300 + "Sandra Gongora rank 19 bronze" + "B" * 2300
+        notebook.store_evidence(1, {"fetch": {
+            "_type": "FETCH", "url": "https://example.test/table", "text": text,
+            "search_hits": [{"term": "match", "text": text}],
+        }})
+        self.assertTrue(any("Sandra Gongora rank 19 bronze" in item["text"]
+                            for item in notebook.passages))
+
+    def test_multi_page_fetch_preview_keeps_tail_evidence(self):
+        value = {"_type": "FETCH", "pages": [{
+            "url": "https://example.test/table",
+            "text": "A" * 2600 + "Sandra Gongora rank 19",
+        }]}
+        preview = preview_one("fetch", value)
+        self.assertIn("Sandra Gongora rank 19", preview)
+        self.assertNotIn("ERROR empty output", preview)
+
+    def test_compact_source_keeps_deep_term_centered_search_hit(self):
+        hits = [{"term": f"term{i}", "text": "A" * 500 + f"term{i} evidence" + "B" * 2400}
+                for i in range(8)]
+        hits[-1]["text"] = "A" * 500 + "kings Jayanandivarman through Vandiyadevan" + "B" * 2400
+        hits[-1]["term"] = "kings"
+        compact = compact_source({"search_hits": hits}, 1800)
+        rendered = json.dumps(compact, ensure_ascii=False)
+        self.assertIn("Jayanandivarman through Vandiyadevan", rendered)
+        self.assertEqual(len(compact["search_hits"]), 4)
+
+    async def test_stream_timeout_is_idle_not_total_duration(self):
+        class Choice:
+            finish_reason = None
+            delta = type("Delta", (), {"content": "x", "reasoning_content": None})()
+        class Stream:
+            def __init__(self): self.i = 0
+            def __aiter__(self): return self
+            async def __anext__(self):
+                if self.i == 3: raise StopAsyncIteration
+                self.i += 1
+                await asyncio.sleep(.03)
+                return type("Chunk", (), {"choices": [Choice()]})()
+        async def request(): return Stream()
+        content, _, _ = await _consume_stream(request(), idle_timeout=.05, max_seconds=.2)
+        self.assertEqual(content, "xxx")
+
+    async def test_stream_still_times_out_when_it_goes_silent(self):
+        class Stream:
+            def __aiter__(self): return self
+            async def __anext__(self):
+                await asyncio.sleep(.1)
+        async def request(): return Stream()
+        with self.assertRaises(TimeoutError):
+            await _consume_stream(request(), idle_timeout=.02, max_seconds=.2)
+
+    async def test_explicitly_rejected_fallback_is_not_returned(self):
+        async def fake_build(_q, _n, _stage, _max):
+            return {"objective": "verify", "best_guess": "Silver", "blocks": [
+                {"id": "verify", "type": "VERIFY", "params": {"candidate": "Silver"}}]}
+        async def fake_execute(_q, _p, notebook, stage, _build):
+            verdict = {"_type": "VERIFY", "candidate": "Silver", "accepted": False,
+                       "reason": "identity condition unsupported"}
+            notebook.record_verification(stage, "Silver", verdict)
+            return {f"s{stage}_verify": verdict}, []
+        old = research_module.build_stage, research_module.execute_stage
+        research_module.build_stage, research_module.execute_stage = fake_build, fake_execute
+        try:
+            result = await research_module.research("Which medal?", 1)
+        finally:
+            research_module.build_stage, research_module.execute_stage = old
+        self.assertEqual(result["answer"], "NEEDS_EVIDENCE: no supported answer candidate")
 
     def test_candidate_memory_preserves_ranked_adviser_candidates(self):
         notebook = ResearchNotebook()
@@ -687,7 +867,15 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
             {"name": "Ada", "status": "supported", "why": "direct source"}]})
         notebook.record_candidates(2, {"candidates": [
             {"name": "Ada", "status": "contradicted", "why": "Grace also matches"}]})
-        self.assertEqual(notebook.candidate_memory["ada"]["status"], "supported")
+        self.assertEqual(notebook.candidate_memory["ada"]["status"], "plausible")
+
+    def test_only_verifier_can_promote_candidate_to_verified(self):
+        notebook = ResearchNotebook()
+        notebook.record_candidates(1, {"candidates": [
+            {"name": "Ada", "status": "supported", "why": "adviser ranking"}]})
+        self.assertEqual(notebook.candidate_memory["ada"]["status"], "plausible")
+        notebook.record_verification(1, "Ada", {"accepted": True, "reason": "all conditions cited"})
+        self.assertEqual(notebook.candidate_memory["ada"]["status"], "verified")
 
     def test_candidate_contradiction_requires_verified_claim_id(self):
         notebook = ResearchNotebook()
@@ -724,10 +912,13 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
     async def test_builder_third_identical_decision_stops(self):
         notebook = ResearchNotebook()
         notebook.set_conditions([{"id": "k1", "description": "identity"}])
+        notebook.store_evidence(1, {"seed": {"_type": "FETCH", "url": "https://example.test",
+                                              "text": "Ada matches the identity clue."}})
         notebook.builder_history = [
             {"stage": 1, "best_guess": "Ada"}, {"stage": 2, "best_guess": "Ada"}]
         async def fake_ask(*_args, **_kwargs):
-            return {"decision": "continue", "best_guess": "Ada", "objective": "more checking",
+            return {"decision": "continue", "answer_complete": True,
+                    "best_guess": "Ada", "objective": "more checking",
                     "blocks": [{"id": "q", "type": "SEARCH", "params": {"queries": ["Ada"]}}]}
         old = director_module.ask_json
         director_module.ask_json = fake_ask
@@ -737,6 +928,75 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
             director_module.ask_json = old
         self.assertEqual(plan["decision"], "answer")
         self.assertEqual(plan["blocks"], [])
+
+    async def test_builder_does_not_early_stop_on_repeated_partial_answer(self):
+        notebook = ResearchNotebook()
+        notebook.set_conditions([
+            {"id": "k1", "description": "name the dynasty"},
+            {"id": "k2", "description": "state the number of kings"},
+        ])
+        notebook.builder_history = [
+            {"stage": 1, "best_guess": "Bana Dynasty"},
+            {"stage": 2, "best_guess": "Bana Dynasty"},
+        ]
+        async def fake_ask(*_args, **_kwargs):
+            return {"decision": "continue", "answer_complete": False,
+                    "best_guess": "Bana Dynasty", "objective": "count the kings",
+                    "blocks": [{"id": "q", "type": "SEARCH",
+                                "params": {"queries": ["Bana kings list"]}}]}
+        old = director_module.ask_json
+        director_module.ask_json = fake_ask
+        try:
+            plan = await director_module.build_stage("Name the dynasty and number of kings", notebook, 3, 8)
+        finally:
+            director_module.ask_json = old
+        self.assertEqual(plan["decision"], "continue")
+        self.assertTrue(plan["blocks"])
+
+    async def test_builder_rejects_ungrounded_direct_answer(self):
+        outputs = [
+            {"conditions": [{"id": "k1", "description": "requested amount"}]},
+            {"decision": "answer", "answer_complete": True,
+             "best_guess": "$1,487,753", "blocks": []},
+            {"decision": "continue", "answer_complete": False,
+             "best_guess": "", "objective": "retrieve evidence",
+             "blocks": [{"id": "q", "type": "SEARCH",
+                         "params": {"queries": ["film initial run gross"]}}]},
+        ]
+        async def fake_ask(*_args, **_kwargs): return outputs.pop(0)
+        old = director_module.ask_json
+        director_module.ask_json = fake_ask
+        try:
+            plan = await director_module.build_stage("How much did it gross?", ResearchNotebook(), 1, 8)
+        finally:
+            director_module.ask_json = old
+        self.assertEqual(plan["decision"], "continue")
+        self.assertFalse(outputs)
+
+    async def test_builder_repair_for_ungrounded_malformed_answer_requires_retrieval(self):
+        outputs = [
+            {"conditions": [{"id": "k1", "description": "identify dynasty"},
+                            {"id": "k2", "description": "state known king count"}]},
+            {"answer": "Bana dynasty", "count": 5},
+            {"decision": "continue", "answer_complete": False,
+             "best_guess": "Bana dynasty, 5 known kings", "objective": "retrieve the chain",
+             "blocks": [{"id": "q", "type": "SEARCH", "params": {
+                 "queries": ["Brihadeeswarar Temple builder sister husband dynasty",
+                             "Bana dynasty known kings list"]}, "depends_on": []}]},
+        ]
+        prompts = []
+        async def fake_ask(_system, user, *_args, **_kwargs):
+            prompts.append(user)
+            return outputs.pop(0)
+        old = director_module.ask_json
+        director_module.ask_json = fake_ask
+        try:
+            plan = await director_module.build_stage("Name the dynasty and king count", ResearchNotebook(), 1, 8)
+        finally:
+            director_module.ask_json = old
+        self.assertEqual(plan["decision"], "continue")
+        self.assertTrue(plan["blocks"])
+        self.assertIn("MUST NOT answer from model memory", prompts[-1])
 
     def test_verifier_rejected_candidates_recorded_in_summary(self):
         notebook = ResearchNotebook()

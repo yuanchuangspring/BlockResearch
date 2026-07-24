@@ -209,6 +209,16 @@ class ResearchNotebook:
         starts = [round(i * (len(text) - width) / (count - 1)) for i in range(count)]
         return [text[start:start + width] for start in starts]
 
+    @classmethod
+    def _covered_hit(cls, text, count=6):
+        """Cover a bounded relevance window without gaps between excerpts."""
+        text = _text(text)
+        width = min(900, max(520, (len(text) + count - 1) // count + 20))
+        if len(text) <= width:
+            return [text] if text else []
+        starts = [round(i * (len(text) - width) / (count - 1)) for i in range(count)]
+        return [text[start:start + width] for start in starts]
+
     def store_evidence(self, stage, outputs):
         """Persist compact source excerpts even when a Solver fails to extract claims."""
         known = {(item.get("source_block_id"), item.get("text")) for item in self.passages}
@@ -219,14 +229,18 @@ class ResearchNotebook:
             for document in documents[:6]:
                 if not isinstance(document, dict) or document.get("error"):
                     continue
-                excerpts = [_text(hit.get("text")) for hit in document.get("search_hits", [])[:3]
-                            if isinstance(hit, dict) and _text(hit.get("text"))]
-                if not excerpts:
-                    excerpts = self._stratified_text(document.get("text", ""))
+                # Relevance windows alone can miss a decisive row in a long table
+                # when common query terms match its heading. Keep them alongside a
+                # small, position-stratified sample of the whole document.
+                excerpts = self._stratified_text(document.get("text", ""))
+                for hit in document.get("search_hits", [])[:1]:
+                    if isinstance(hit, dict) and _text(hit.get("text")):
+                        excerpts += self._covered_hit(hit.get("text", ""))
+                excerpts = list(dict.fromkeys(excerpts))
                 if not excerpts and "data" in document:
                     raw = json.dumps(document.get("data"), ensure_ascii=False, default=str)
                     excerpts = self._stratified_text(raw)
-                for excerpt in excerpts[:4]:
+                for excerpt in excerpts[:10]:
                     key = (block_id, excerpt)
                     if not excerpt or key in known:
                         continue
@@ -366,7 +380,16 @@ class ResearchNotebook:
                 "outcome": "error" if result.get("error") else "ok",
                 "error": _text(result.get("error"))[:240],
             })
-        self.action_ledger = self.action_ledger[-24:]
+        self.action_ledger = self.action_ledger[-64:]
+
+    def attempted_queries(self, limit=64):
+        """Compact retrieval history so Builder can see beyond the last stage."""
+        queries = []
+        for action in self.action_ledger:
+            if action.get("type") not in {"SEARCH", "BROWSE"}:
+                continue
+            queries.extend(_text(item) for item in action.get("targets", []) if _text(item))
+        return list(dict.fromkeys(queries))[-limit:]
 
     def record_builder(self, stage, plan):
         self.builder_history.append({
@@ -394,9 +417,11 @@ class ResearchNotebook:
             status = _text(item.get("status")) or old.get("status", "plausible")
             contradiction_ids = [value for value in _items(item.get("contradiction_claim_ids"))
                                  if value in verified_ids]
-            # Candidate ranking is advice, not evidence. A negative state transition
-            # requires an explicit verified contradiction; absence of proof or support
-            # for a competing candidate cannot erase an existing hypothesis.
+            # Solver ranking is advice. Only the verifier can certify a compound
+            # candidate; a quote-backed atomic claim does not prove that the Solver
+            # mapped it to the question's exact relation correctly.
+            if status == "supported":
+                status = "plausible"
             if status == "contradicted" and not contradiction_ids:
                 status = old.get("status", "plausible")
                 if status == "contradicted":
@@ -433,8 +458,10 @@ class ResearchNotebook:
                   "contradicted_condition_ids": [_text(x) for x in _items(verdict.get("contradicted_condition_ids")) if _text(x)]}
         self.verification_history.append(record)
         self.verification_history = self.verification_history[-3:]
+        key = record["candidate"].lower()
+        if record["accepted"] and key in self.candidate_memory:
+            self.candidate_memory[key]["status"] = "verified"
         if not record["accepted"] and record["reason"]:
-            key = record["candidate"].lower()
             if key in self.candidate_memory:
                 self.candidate_memory[key]["verification_failures"] = self.candidate_memory[key].get("verification_failures", 0) + 1
             self.questions = (self.questions + [record["reason"]])[-12:]
@@ -548,11 +575,11 @@ class ResearchNotebook:
         verifications = [{**item, "reason": _text(item.get("reason"))[:400]}
                          for item in self.verification_history[-2:]]
         actions = []
-        for item in self.action_ledger[-4:]:
+        for item in self.action_ledger[-8:]:
             actions.append({**item, "targets": [_text(x)[:180] for x in item.get("targets", [])[:4]]})
         return json.dumps({
             "source_policy": "search_leads are untrusted navigation hints, never facts; ignore query echoes, unrelated domains, and snippets without a concrete named entity",
-            "candidate_policy": "hypotheses contain concrete named entities only; any candidate contradicting a required condition is pruned and must not drive confirmation search",
+            "candidate_policy": "Solver candidate labels are provisional; compare atomic claims against the exact directed relation, time and qualifiers before answering; only verifier acceptance certifies a compound answer",
             "conditions": self.conditions,
             "verified_claims": claims,
             "derived_inferences": self.inferences[-6:],
@@ -575,6 +602,7 @@ class ResearchNotebook:
                 "rule": "answer when the same candidate leads for two decisions and no live alternative has evidence likely to overtake it; unresolved confidence-only details do not justify another stage",
             },
             "failed_or_completed_actions": actions,
+            "attempted_queries": self.attempted_queries(),
         }, ensure_ascii=False)
 
     def evidence_graph(self):

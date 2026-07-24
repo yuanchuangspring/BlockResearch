@@ -8,6 +8,28 @@ def json_text(value, limit=60000):
     return json.dumps(value, ensure_ascii=False, default=str)[:limit]
 
 
+def _clip_text(text, limit):
+    """Bound text while retaining both the document setup and its tail rows."""
+    text = str(text or "")
+    if len(text) <= limit:
+        return text
+    head = limit // 2
+    return text[:head] + "\n…\n" + text[-(limit - head):]
+
+
+def _clip_hit(hit, limit=1000):
+    """Keep the passage around the hit term instead of unrelated window edges."""
+    text = str(hit.get("text", ""))
+    term = str(hit.get("term", ""))
+    if len(text) <= limit:
+        return text
+    pos = text.casefold().find(term.casefold()) if term and term != "dense match" else -1
+    if pos < 0:
+        return _clip_text(text, limit)
+    start = min(max(0, pos - limit // 3), len(text) - limit)
+    return text[start:start + limit]
+
+
 def answer_value(text: str):
     for line in reversed(str(text).strip().splitlines()):
         match = re.search(r"(?:FINAL\s*)?(?:ANSWER|答案)\s*[：:]\s*(.+)", line, re.I)
@@ -28,8 +50,17 @@ def preview_one(block_id, value):
             for item in value["search_hits"][:8]
         )
         return f"{block_id} hits:\n{hits}"
+    if isinstance(value.get("pages"), list):
+        pages = []
+        for i, page in enumerate(value["pages"][:6], 1):
+            if not isinstance(page, dict) or not page.get("text"):
+                continue
+            pages.append(f"{block_id}[page {i}] {page.get('url', '')}: " +
+                         _clip_text(page["text"], 2200).replace("\n", " "))
+        if pages:
+            return "\n".join(pages)
     if value.get("text"):
-        return f"{block_id}: {value['text'][:1800].replace(chr(10), ' ')}"
+        return f"{block_id}: {_clip_text(value['text'], 1800).replace(chr(10), ' ')}"
     if "data" in value:
         return f"{block_id} data: {json_text(value['data'], 6000)}"
     if value.get("queries") or value.get("hypotheses"):
@@ -76,7 +107,7 @@ def compact_source(value, text_limit=6000):
     """Keep every evidence type while bounding any one source's context share."""
     value = dict(value) if isinstance(value, dict) else {"value": value}
     if "text" in value:
-        value["text"] = value["text"][:text_limit]
+        value["text"] = _clip_text(value["text"], text_limit)
     if "links" in value:
         value["links"] = value["links"][:12]
     if "results" in value:
@@ -90,8 +121,10 @@ def compact_source(value, text_limit=6000):
             compact_source(page, min(text_limit, 4000)) for page in value["pages"][:3]
         ]
     if "search_hits" in value:
+        hits = value["search_hits"]
+        chosen = hits[:2] + (hits[-2:] if len(hits) > 2 else [])
         value["search_hits"] = [
-            {**hit, "text": hit.get("text", "")[:1000]} for hit in value["search_hits"][:4]
+            {**hit, "text": _clip_hit(hit, 1000)} for hit in chosen
         ]
     for field in ("first_page", "last_page", "stdout", "reasoning"):
         if field in value:

@@ -114,6 +114,10 @@ INFORMATION FLOW
 - Never decide an answer before executing blocks whose observations could change that answer. `decision:"answer"` means the answer is already known from current state and therefore `blocks` must be empty.
 - When continuing, return `decision:"continue"`; newly executed observations will inform the next Builder stage or a dependent node in the current graph.
 - Search snippets are provisional navigation leads. Fetched text and valid derived inferences support evidence. Preserve useful intermediate entities even when they are not answer candidates.
+- Solver rankings and candidate status labels are advice. Re-evaluate them from the atomic claims; only `recent_verifications` can certify that a compound answer satisfies the question.
+- Before answering, compare every live candidate against the exact relation in the question. Keep direction, predicate, time, and qualifiers intact. Similar entities or nearby relations do not satisfy a condition.
+- `best_guess` must contain every value explicitly requested by the question. A partial identity, tuple, list, count, date, unit, or explanation is an incomplete answer even when its supplied part is correct.
+- Preserve the scope of the requested attribute. Prefer evidence whose wording directly matches the requested time period, geography, release, population, or measurement; never broaden that scope merely because a source also reports a larger aggregate.
 
 PLANNING
 1. Identify what changed in state and which uncertainty currently controls candidate ranking.
@@ -125,6 +129,10 @@ If last_stage.consecutive_zero_stages is 2 or more, do not repeat the same tool 
 
 SEARCH QUERY DESIGN
 Write 2-4 precise, genuinely complementary queries for each SEARCH node. Each query should retrieve one concrete node or relation. Preserve discriminating dates, names, domains, and relation direction; infer the likely source type and its natural wording. Do not make every query depend on the same quoted phrase, repeat prior zero-gain queries, use placeholders, or stuff the whole question into one query. Once concrete entities appear, pivot subsequent searches from those exact entities.
+If an exact multi-clue signature returns no named candidate, relax structurally: search one indexable edge to enumerate concrete intermediate entities, then test the remaining constraints against those entities. Do not keep paraphrasing the same full signature or merely rotate site filters.
+For hidden-entity questions, do not silently restrict enumeration to famous or top-level entities; preserve relevant regional, historical, lower-tier, subsidiary, and category variants exposed by the source taxonomy.
+Treat candidates found through only a broad demographic, date, or topical clue as weak leads. Until one also matches a rare decisive relation, keep discovery open and do not spend the whole next stage verifying it.
+When SEARCH exposes a plausible concrete page or entity, the next graph must consume it through FETCH/BROWSE or an entity-based hop. More SEARCH variants of the original clues do not count as progress.
 
 AVAILABLE NODES
 - SEARCH {branch_id:"optional", queries:["2-4 precise queries"], queries_from_dependencies:false, n:10}
@@ -141,14 +149,16 @@ GRAPH CONTRACT
 - Return 0-8 blocks with unique ids and valid depends_on edges.
 - Never invent URLs, observations, facts, candidates, or textual data plumbing.
 - Read failed_or_completed_actions; do not repeat zero-gain retrieval unchanged.
+- `attempted_queries` is the cross-stage query history. Never emit any listed query again; choose a different entity, relation edge, source taxonomy, or direct page inspection instead of paraphrasing the same route.
+- Exhaustive list/count/partition tasks require coverage evidence. Prefer one complete structured table slice; otherwise build a bounded batch graph that covers the full known index/range and join every batch. Examples or a placeholder for unseen members never make `answer_complete` true.
 - FETCH parses HTML, JSON, CSV/TSV, XLSX, DOCX and PDF. For long sources set `search` to the exact unresolved relation so evidence passages are centered correctly.
 - Every node receives only its declared direct dependencies. Connect PYTHON/SOLVE to every input it must join; do not rely on transitive ancestor leakage.
 - Use only condition ids already present in RESEARCH STATE.
-- A direct answer must use exactly `{"decision":"answer","best_guess":"exact requested value","blocks":[]}`.
+- A direct answer must use exactly `{"decision":"answer","answer_complete":true,"best_guess":"exact requested value","blocks":[]}`. Set `answer_complete:false` while any requested field is missing.
 - Otherwise use decision:"continue" and provide an executable nonempty graph.
 
 Return only:
-{"decision":"continue|answer","objective":"...","rationale":"...","focus_condition_ids":["k1"],"expected_observation":"...","best_guess":"current guess or empty","conditions":[],"blocks":[{"id":"...","type":"...","params":{},"depends_on":[]}]}
+{"decision":"continue|answer","answer_complete":false,"objective":"...","rationale":"...","focus_condition_ids":["k1"],"expected_observation":"...","best_guess":"current guess or empty","conditions":[],"blocks":[{"id":"...","type":"...","params":{},"depends_on":[]}]}
 """
 
 CONDITION_PROMPT = """You are the Question Modeler. Decompose the research question into atomic verification conditions; do not research, plan searches, name candidates, infer the answer, or build an execution graph.
@@ -157,18 +167,21 @@ Return {"conditions":[{"id":"k1","description":"..."}]}."""
 
 SOLVER_PROMPT = """You are a professional research adviser reporting to the Builder. Analyze only the focused task and supplied stage material. Do not orchestrate the research program or design another execution graph.
 Preserve verified facts; never overturn them without explicit contradictory evidence. Missing support means plausible/unsupported, never contradicted. Evidence that another candidate also matches is compatible support, not a contradiction. Mark a candidate contradicted only when a verified claim is logically incompatible with a required condition, and cite its claim id in contradiction_claim_ids.
-Candidate coverage is mandatory: scan every supplied result card and page before ranking. Include every concrete answer-type entity that matches at least one discriminating relation as a plausible candidate, even when it is only a search lead. Mark it plausible and explain the lead; do not omit it merely because it is not yet verified. This is candidate recall, not evidence promotion.
+Candidate coverage is mandatory: scan every supplied result card and page before ranking. Include every concrete answer-type entity attached to a potentially relevant relation, even when it is only a search lead. Preserve each relation's direction, exact predicate, time, and qualifiers. Compare competing relation tuples explicitly before ranking; shared words or a nearby but different predicate are insufficient. Mark search leads plausible and never promote them to evidence.
 First extract useful atomic direct claims from fetched pages. Every claim must include a short near-verbatim quote, the exact source_id/block id or page URL present in the dependency observations, mentioned entities, and relevant condition_ids. The program will reject claims whose quote is absent from that source. Search snippets are leads and cannot become claims.
-Then give the Builder only a short change summary, ranked concrete candidates, the single decisive gap, and the best current guess. Always provide best_guess when any plausible candidate exists, even when evidence is incomplete.
+Then give the Builder only a short change summary, ranked concrete candidates, the single decisive gap, and the best current guess. Candidate status is advisory and cannot certify a compound condition. Always provide best_guess when any plausible candidate exists, even when evidence is incomplete.
 If and only if YOUR TASK asks for retrieval strategy or query formulation, include 4-8 concise diverse web queries in queries. These are advice for a dependent SEARCH node, not an execution graph. Otherwise return an empty queries list.
 For ambiguous or existential bridge clues, preserve multiple alternatives. A best-known or first-found bridge is not a unique resolution.
 Only propose an answer when the evidence supports the exact entity and requested attribute.
 answer_candidate must be only the succinct value requested by the question: no explanation, confidence, aliases, parentheses, or location unless explicitly requested.
+Match the question's requested scope exactly. Keep domestic, worldwide, initial release, re-release, lifetime, annual, and cumulative values distinct; a broader aggregate cannot replace a directly matching value.
+For list or count questions, inspect the complete supplied source section, merge continued text from the same page, enumerate the qualifying entries internally, and then report the count. A relevant list split across excerpts remains one list.
+If the question requests multiple fields, best_guess must contain all of them. Never return only the identified entity when a count, date, amount, explanation, or second field is also requested.
 Never propose an item in rejected_answers again unless a new verified claim directly supports it.
 Only concrete named entities are candidates. Keep an unidentified profile in gaps; never turn query-echo geography or a generic description into a hypothesis.
 Keep memo, why, decisive_gap and recommendation below 300 characters each. Return at most 12 claims and 12 candidates. Do not narrate the source-reading process or repeat evidence in prose.
 Return only this compact report:
-{"memo":"what changed and why","queries":[],"claims":[{"claim":"...","quote":"...","source_id":"...","entities":[],"condition_ids":[]}],"candidates":[{"name":"...","status":"supported|plausible|contradicted","why":"...","contradiction_claim_ids":[]}],"decisive_gap":"...","recommendation":"...","best_guess":"..."}."""
+{"memo":"what changed and why","queries":[],"claims":[{"claim":"atomic subject-predicate-object fact with qualifiers","quote":"...","source_id":"...","entities":[],"condition_ids":[]}],"candidates":[{"name":"...","status":"plausible|contradicted","why":"exact matching or mismatching relation","contradiction_claim_ids":[]}],"decisive_gap":"...","recommendation":"...","best_guess":"..."}."""
 
 VERIFIER_PROMPT = """You are the final Answer Verifier. You may accept or reject the Solver's exact candidate; you may not replace it.
 
@@ -185,6 +198,12 @@ def _model(role, default=None):
     return env(f"{role}_MODEL") or default or env("OPENAI_MODEL")
 
 
+def _director_tokens(model, default):
+    """Leave reasoning models enough room to emit their final JSON."""
+    configured = env("DIRECTOR_MAX_TOKENS")
+    return int(configured) if configured else (8192 if str(model).startswith("deepseek") else default)
+
+
 def _focused_excerpt(text, focus, limit=2500):
     """Blend task-matched and stratified windows; avoid prefix-only information loss."""
     text = re.sub(r"\s+", " ", str(text or "")).strip()
@@ -192,19 +211,57 @@ def _focused_excerpt(text, focus, limit=2500):
         return text
     terms = list(dict.fromkeys(term.casefold() for term in re.findall(r"[\w-]+", focus)
                               if len(term) >= 4))[:24]
-    lower, chunks = text.casefold(), []
+    lower, chunks, separator = text.casefold(), [], "\n…\n"
     positions = [lower.find(term) for term in terms if lower.find(term) >= 0]
     if positions:
         best = max(positions, key=lambda pos: sum(term in lower[max(0, pos-500):pos+1000]
                                                   for term in terms))
-        chunks.append(text[max(0, best - 400):best + 1100])
-    width = max(260, (limit - sum(map(len, chunks))) // 3)
+        match_width = max(120, limit // 2)
+        before = min(400, max(60, match_width // 3))
+        start = min(max(0, best - before), max(0, len(text) - match_width))
+        chunks.append(text[start:start + match_width])
+    separator_budget = len(separator) * (3 if chunks else 2)
+    width = max(60, (limit - sum(map(len, chunks)) - separator_budget) // 3)
     for i in range(3):
         start = round(i * max(0, len(text) - width) / 2)
         chunk = text[start:start + width]
         if chunk and chunk not in chunks:
             chunks.append(chunk)
-    return "\n...[excerpt]...\n".join(chunks)[:limit]
+    return separator.join(chunks)[:limit]
+
+
+def _relevant_pages(pages, focus, limit=4):
+    """Choose task-relevant pages without changing the Solver/Builder boundary."""
+    pages = [page for page in pages if isinstance(page, dict)]
+    if len(pages) <= limit:
+        return pages
+    terms = list(dict.fromkeys(term.casefold() for term in re.findall(r"[\w-]+", focus)
+                              if len(term) >= 4))[:24]
+    ranked = []
+    for index, page in enumerate(pages):
+        hit_text = " ".join(str(hit.get("text", "")) for hit in page.get("search_hits", [])
+                            if isinstance(hit, dict))
+        body = f"{page.get('url', '')} {page.get('text', '')} {hit_text}".casefold()
+        coverage = sum(term in body for term in terms)
+        frequency = sum(min(body.count(term), 3) for term in terms)
+        ranked.append((coverage * 20 + frequency, -index, page))
+    return [item[2] for item in sorted(ranked, reverse=True)[:limit]]
+
+
+def _relevant_hits(hits, focus, limit=4):
+    hits = [hit for hit in hits if isinstance(hit, dict)]
+    terms = list(dict.fromkeys(term.casefold() for term in re.findall(r"[\w-]+", focus)
+                              if len(term) >= 4))[:24]
+    bodies = [str(hit.get("text", "")).casefold() for hit in hits]
+    document_frequency = {term: sum(term in body for body in bodies) for term in terms}
+    ranked = []
+    for index, (hit, body) in enumerate(zip(hits, bodies)):
+        # A rare task term is more discriminating than generic words repeated
+        # across every page of a long PDF or site.
+        score = sum((20 + min(body.count(term), 3)) / max(document_frequency[term], 1)
+                    for term in terms if term in body)
+        ranked.append((score, -index, hit))
+    return [item[2] for item in sorted(ranked, reverse=True)[:limit]]
 
 
 def _solver_bundle(observations, focus=""):
@@ -225,13 +282,14 @@ def _solver_bundle(observations, focus=""):
                 queries = list(dict.fromkeys(str(item.get("query", "")).strip() for item in rows
                                              if str(item.get("query", "")).strip()))
             cards = []
-            for item in rows:
+            for index, item in enumerate(rows):
                 url = str(item.get("url", ""))
                 domain = re.sub(r"^www\.", "", re.sub(r"^https?://", "", url).split("/", 1)[0])
                 query = str(item.get("query", "")).strip()
                 cards.append({
                     "title": str(item.get("title", ""))[:140],
-                    "snippet": str(item.get("snippet", ""))[:140],
+                    "snippet": _focused_excerpt(item.get("snippet", ""), focus,
+                                                 900 if index == 0 else 300),
                     "domain": domain[:80], "rank": item.get("rank"),
                     "query_id": queries.index(query) + 1 if query in queries else None,
                 })
@@ -244,30 +302,123 @@ def _solver_bundle(observations, focus=""):
                 clipped["text"] = _focused_excerpt(value.get("text"), focus)
             if isinstance(value.get("pages"), list):
                 clipped["pages"] = []
-                for page in value["pages"][:4]:
+                for page in _relevant_pages(value["pages"], focus, 4):
                     compact = compact_source(page, 1800)
                     if isinstance(page, dict) and page.get("text"):
                         compact["text"] = _focused_excerpt(page.get("text"), focus, 1800)
+                    if isinstance(page, dict) and page.get("search_hits"):
+                        compact["search_hits"] = [
+                            {**hit, "text": _focused_excerpt(hit.get("text", ""), focus, 1800)}
+                            for hit in _relevant_hits(page["search_hits"], focus, 4)
+                        ]
                     clipped["pages"].append(compact)
             bundle[key] = clipped
     return bundle
 
 
 def _bounded_bundle(bundle, limit=5500):
-    """Return valid JSON under budget; never cut serialized data mid-object."""
-    kept, omitted = {}, []
-    for key, value in bundle.items():
-        candidate = {**kept, key: value}
-        if len(json.dumps(candidate, ensure_ascii=False, default=str)) <= limit:
-            kept[key] = value
+    """Give every direct dependency a fair, evidence-aware share of context."""
+    if not bundle:
+        return "{}"
+    share = max(700, (limit - 200) // len(bundle))
+
+    def clip(text, size):
+        text = str(text or "")
+        if len(text) <= size:
+            return text
+        head = size // 2
+        return text[:head] + " … " + text[-(size - head):]
+
+    def shrink(value):
+        kind = value.get("_type", "")
+        if kind == "SEARCH":
+            rows = value.get("results", [])
+            # Retain both leading and deeper routes; relation-bearing words often
+            # occur near the end of a search snippet.
+            chosen = rows[:3] + (rows[-2:] if len(rows) > 3 else [])
+            return {"_type": kind, "queries": value.get("queries", [])[:4],
+                    "results": [{"title": clip(row.get("title"), 100),
+                                 "snippet": (str(row.get("snippet", "")) if index == 0
+                                             else clip(row.get("snippet"), 220)),
+                                 "domain": row.get("domain", ""), "rank": row.get("rank")}
+                                for index, row in enumerate(chosen)]}
+        result = {"_type": kind}
+        if value.get("text"):
+            result.update({"url": value.get("url", ""), "text": clip(value["text"], share - 250)})
+        structured = []
+        documents = [value] + ([page for page in value.get("pages", []) if isinstance(page, dict)]
+                               if isinstance(value.get("pages"), list) else [])
+        for document in documents:
+            for hit in document.get("search_hits", []):
+                if not isinstance(hit, dict):
+                    continue
+                text = str(hit.get("text", ""))
+                tokens = re.findall(r"[\w-]+", text.casefold())
+                diversity = len(set(tokens)) / max(len(tokens), 1)
+                complete_table = str(hit.get("term", "")).startswith("table:")
+                score = ((100000 if complete_table else 0) + text.count("\n") * 200 +
+                         diversity * 100 + min(len(text), 1200) / 100)
+                structured.append((score, document.get("url", value.get("url", "")), hit))
+        if structured:
+            _, url, hit = max(structured, key=lambda item: item[0])
+            result["structured_evidence"] = {
+                "url": url, "term": hit.get("term", ""),
+                "text": clip(hit.get("text", ""),
+                             min(5000 if str(hit.get("term", "")).startswith("table:") else 1100,
+                                 max(700, share - 500))),
+            }
+        if isinstance(value.get("pages"), list):
+            pages = [page for page in value["pages"][:3] if isinstance(page, dict)]
+            page_share = max(260, (share - (1000 if structured else 300)) // max(1, len(pages)))
+            result["pages"] = []
+            for page in pages:
+                hits = page.get("search_hits", [])
+                if hits:
+                    selected = hits[:1]
+                    result["pages"].append({"url": page.get("url", ""), "search_hits": [
+                        {"term": hit.get("term", ""),
+                         "text": clip(hit.get("text", ""), max(220, page_share // len(selected)))}
+                        for hit in selected if isinstance(hit, dict)]})
+                else:
+                    result["pages"].append({"url": page.get("url", ""),
+                                            "text": clip(page.get("text", ""), page_share)})
+        if value.get("results") and kind != "SEARCH":
+            result["results"] = [{"title": clip(row.get("title"), 90),
+                                  "snippet": clip(row.get("snippet"), 180),
+                                  "url": row.get("url", "")}
+                                 for row in value["results"][:3] if isinstance(row, dict)]
+        if len(result) == 1:
+            result.update(compact_source(value, max(400, share - 200)))
+        return result
+
+    kept = {key: shrink(value) for key, value in bundle.items()}
+    # SEARCH/BROWSE/FETCH branches may carry the same passage. Keep one full
+    # copy (prefer the later, usually fetched dependency) instead of clipping
+    # two duplicates until both lose the middle of an enumeration.
+    seen_structured = set()
+    for value in reversed(list(kept.values())):
+        evidence = value.get("structured_evidence")
+        if not isinstance(evidence, dict):
             continue
-        smaller = compact_source(value, 1200)
-        if len(json.dumps({**kept, key: smaller}, ensure_ascii=False, default=str)) <= limit:
-            kept[key] = smaller
+        signature = (evidence.get("url"), evidence.get("text"))
+        if signature in seen_structured:
+            value.pop("structured_evidence", None)
         else:
-            omitted.append(key)
-    if omitted:
-        kept["_omitted"] = omitted
+            seen_structured.add(signature)
+    # Shrinking above is approximate; reduce the largest text fields together
+    # rather than deleting an entire dependency when JSON overhead is high.
+    while len(json.dumps(kept, ensure_ascii=False, default=str)) > limit:
+        fields = []
+        for value in kept.values():
+            if isinstance(value.get("text"), str): fields.append((value, "text"))
+            if isinstance(value.get("structured_evidence"), dict):
+                fields.append((value["structured_evidence"], "text"))
+            for page in value.get("pages", []):
+                if isinstance(page, dict) and isinstance(page.get("text"), str): fields.append((page, "text"))
+        target = max(fields, key=lambda pair: len(pair[0][pair[1]]), default=None)
+        if not target or len(target[0][target[1]]) < 160:
+            break
+        target[0][target[1]] = clip(target[0][target[1]], int(len(target[0][target[1]]) * .75))
     return json.dumps(kept, ensure_ascii=False, default=str)
 
 
@@ -300,13 +451,37 @@ def _retrieval_inputs_ok(plan):
     return True
 
 
+def _query_key(value):
+    """Match operationally identical queries without changing their semantics."""
+    return " ".join(str(value).split()).casefold()
+
+
+def _retrieval_queries_novel(plan, notebook):
+    """Reject exact repeats across prior stages and parallel nodes."""
+    seen = {_query_key(query) for query in notebook.attempted_queries()}
+    for block in plan.get("blocks", []):
+        if not isinstance(block, dict) or str(block.get("type", "")).upper() not in {"SEARCH", "BROWSE"}:
+            continue
+        params = block.get("params") or {}
+        raw = params.get("queries", params.get("query", []))
+        queries = raw if isinstance(raw, list) else [raw]
+        for query in queries:
+            key = _query_key(query)
+            if key and key in seen:
+                return False
+            if key:
+                seen.add(key)
+    return True
+
+
 async def _model_question(question):
     """Question modeling is a required role, so transient/empty output is retryable."""
     last_error = None
     for attempt in range(1, 4):
         try:
+            model = _model("DIRECTOR")
             modeled = await ask_json(CONDITION_PROMPT, f"QUESTION:\n{question}",
-                                     _model("DIRECTOR"), 3072, attempts=1)
+                                     model, _director_tokens(model, 3072), attempts=1)
             if isinstance(modeled.get("conditions"), list) and modeled["conditions"]:
                 record("role_result", role="question_modeler", attempt=attempt,
                        input={"question": question}, output=modeled)
@@ -318,7 +493,7 @@ async def _model_question(question):
                    input={"question": question}, error=f"{type(exc).__name__}: {exc}")
             if attempt < 3:
                 print(f"[QUESTION MODELER RETRY] attempt {attempt}/3 failed: "
-                      f"{type(exc).__name__}; retrying", flush=True)
+                      f"{type(exc).__name__}: {str(exc)[:180]}; retrying", flush=True)
                 await asyncio.sleep(attempt)
     raise last_error
 
@@ -332,7 +507,9 @@ async def build_stage(question, notebook, stage, max_stages):
     user, issues, model_failures, validation_attempt = base_user, [], 0, 0
     while validation_attempt < 3:
         try:
-            plan = await ask_json(GRAPH_BUILDER_PROMPT, user, _model("DIRECTOR"), 4096, attempts=1)
+            model = _model("DIRECTOR")
+            plan = await ask_json(GRAPH_BUILDER_PROMPT, user, model,
+                                  _director_tokens(model, 4096), attempts=1)
             record("role_result", role="builder", stage=stage,
                    input={"question": question, "research_state": state,
                           "stage": stage, "max_stages": max_stages}, output=plan)
@@ -346,29 +523,50 @@ async def build_stage(question, notebook, stage, max_stages):
             continue
         validation_attempt += 1
         language_ok = _stage_one_language_ok(question, plan)
-        answering = plan.get("decision") == "answer" and bool(str(plan.get("best_guess", "")).strip())
+        answering = (plan.get("decision") == "answer"
+                     and plan.get("answer_complete") is True
+                     and bool(str(plan.get("best_guess", "")).strip()))
+        grounded = bool(notebook.claims or notebook.inferences or notebook.passages)
         blocks = plan.get("blocks")
         blocks_ok = isinstance(blocks, list) and (bool(blocks) or answering)
         answer_shape_ok = plan.get("decision") != "answer" or (answering and blocks == [])
+        answer_evidence_ok = plan.get("decision") != "answer" or grounded
         retrieval_ok = _retrieval_inputs_ok(plan)
+        retrieval_novel = _retrieval_queries_novel(plan, notebook)
         issues = [name for name, ok in (("blocks", blocks_ok), ("answer_shape", answer_shape_ok),
+                                        ("answer_evidence", answer_evidence_ok),
                                         ("retrieval_queries", retrieval_ok),
+                                        ("retrieval_repetition", retrieval_novel),
                                         ("language", language_ok)) if not ok]
         if not issues:
             guess = str(plan.get("best_guess", "")).strip()
             prior = [str(item.get("best_guess", "")).strip() for item in notebook.builder_history[-2:]]
-            if (plan.get("decision") != "answer" and guess and len(prior) == 2
+            if (plan.get("decision") != "answer" and plan.get("answer_complete") is True and grounded
+                    and guess and len(prior) == 2
                     and prior[0].casefold() == prior[1].casefold() == guess.casefold()):
                 plan.update({"decision": "answer", "blocks": [],
                              "rationale": (str(plan.get("rationale", "")) +
                                            " The Builder selected the same answer for three consecutive decisions; stop.").strip()})
             return plan
         print(f"[BUILDER RETRY] graph {validation_attempt}/3 violated: {', '.join(issues)}; retrying", flush=True)
+        if not grounded:
+            correction = (
+                "RESEARCH STATE contains no fetched evidence, so you MUST NOT answer from model memory. "
+                "Return decision:\"continue\", answer_complete:false, and a nonempty executable retrieval DAG. "
+                "You may preserve a complete provisional value in best_guess, but SEARCH/BROWSE must discover "
+                "the identity chain and requested attribute, with FETCH and SOLVE dependencies when extraction is needed."
+            )
+        else:
+            correction = (
+                "Repair the contract while preserving only conclusions supported by RESEARCH STATE. "
+                "If the evidence is incomplete, continue with an executable graph."
+            )
         repair = (
             f"Your previous JSON violated: {', '.join(issues)}.\n"
             f"INVALID JSON:\n{json.dumps(plan, ensure_ascii=False, default=str)[:6000]}\n\n"
-            "Repair it without changing the research conclusion. If answering, return exactly "
-            '{"decision":"answer","best_guess":"exact requested value","blocks":[]}. '
+            f"{correction}\n"
+            "If answering from existing evidence, return exactly "
+            '{"decision":"answer","answer_complete":true,"best_guess":"exact requested value","blocks":[]}. '
             "If continuing, every block must be exactly shaped as "
             '{"id":"unique","type":"SEARCH|BROWSE|FETCH|READ_PDF|CALCULATE|PYTHON|SOLVE|VERIFY",'
             '"params":{},"depends_on":[]}; SEARCH/BROWSE queries belong inside params.queries. '
@@ -393,14 +591,21 @@ async def solve_node(question, task, role, notebook, observations):
     primary_tokens = (int(env("DEEPSEEK_SOLVER_MAX_TOKENS", 8192))
                       if str(primary_model).startswith("deepseek") else 4096)
     for attempt in range(1, 3):
+        attempt_tokens = min(primary_tokens * (2 ** (attempt - 1)), 32768)
         try:
-            result = await ask_json(SOLVER_PROMPT, user, primary_model, primary_tokens, attempts=1)
+            result = await ask_json(SOLVER_PROMPT, user, primary_model, attempt_tokens, attempts=1)
             record("role_result", role="solver", input={"question": question, "role": role,
                    "task": task, "research_state": notebook.solver_state(),
                    "dependency_observations": bundle}, output=result)
             return result
         except recoverable as exc:
-            action = "retrying GPT" if attempt < 2 else "switching to deepseek-v4-pro"
+            fallback_model = _model("FALLBACK_SOLVER", "deepseek-v4-pro")
+            if attempt < 2:
+                action = f"retrying {primary_model} with up to {min(primary_tokens * 2, 32768)} output tokens"
+            elif fallback_model == primary_model:
+                action = f"final retry on {fallback_model}"
+            else:
+                action = f"switching to {fallback_model}"
             print(f"  [SOLVE RETRY] attempt {attempt}/2 failed: {type(exc).__name__}: "
                   f"{str(exc)[:160]}; {action}", flush=True)
             record("role_error", role="solver", attempt=attempt,
@@ -413,6 +618,8 @@ async def solve_node(question, task, role, notebook, observations):
     fallback_model = _model("FALLBACK_SOLVER", "deepseek-v4-pro")
     fallback_tokens = (int(env("DEEPSEEK_SOLVER_MAX_TOKENS", 8192))
                        if str(fallback_model).startswith("deepseek") else 4096)
+    if fallback_model == primary_model:
+        fallback_tokens = min(primary_tokens * 2, 32768)
     report = await ask_json(SOLVER_PROMPT, user, fallback_model, fallback_tokens, attempts=1)
     record("role_result", role="solver_fallback", input={"question": question, "role": role,
            "task": task, "research_state": notebook.solver_state(),

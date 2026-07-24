@@ -80,11 +80,22 @@ def _json_object(text: str):
     return None
 
 
-async def _consume_stream(request):
-    """Collect an OpenAI-compatible stream while keeping long proxy connections alive."""
+async def _consume_stream(request, idle_timeout=120, max_seconds=300):
+    """Collect a stream; time out on silence rather than total reasoning time."""
     stream = await request
     content, reasoning, finish = [], [], "unknown"
-    async for part in stream:
+    iterator = stream.__aiter__()
+    started = asyncio.get_running_loop().time()
+    while True:
+        remaining = max_seconds - (asyncio.get_running_loop().time() - started)
+        if remaining <= 0:
+            raise TimeoutError(f"stream exceeded {max_seconds:.0f}s total limit")
+        try:
+            part = await asyncio.wait_for(iterator.__anext__(), min(idle_timeout, remaining))
+        except StopAsyncIteration:
+            break
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError(f"stream idle for {min(idle_timeout, remaining):.0f}s") from exc
         if not part.choices:
             continue
         choice = part.choices[0]
@@ -117,8 +128,11 @@ async def ask(system: str, user: str, model=None, max_tokens=8192, retries=1) ->
                    max_tokens=budget, reasoning_effort=params.get("reasoning_effort"))
             request = _get(model).chat.completions.create(**params)
             if _streaming(model):
-                content, reasoning, finish = await asyncio.wait_for(
-                    _consume_stream(request), float(env("LLM_HARD_TIMEOUT", 120)))
+                content, reasoning, finish = await _consume_stream(
+                    request,
+                    idle_timeout=float(env("LLM_HARD_TIMEOUT", 120)),
+                    max_seconds=float(env("LLM_STREAM_MAX_SECONDS", 300)),
+                )
             else:
                 resp = await request
                 choice = resp.choices[0]
